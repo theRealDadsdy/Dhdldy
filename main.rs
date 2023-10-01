@@ -1,3 +1,6 @@
+use crate::parser::full_parse;
+use crate::type_parser::find_types;
+
 trait CallOn: Sized {
     fn call_on<T>(self, f: impl FnMut(Self) -> T) -> T;
 }
@@ -13,23 +16,13 @@ mod tokenizer {
     use std::str::Chars;
     
     #[derive(Debug, Clone, Copy)]
-    pub enum Comparison {
-        Eq,
-        Ne,
-        Lt,
-        Gt,
-        Le,
-        Ge,
-    }
-    
-    #[derive(Debug, Clone, Copy)]
     pub enum Keyword {
         True,
         False,
         FuncDef,
         Map,
         Foreach,
-        If(Comparison),
+        If,
         Else,
     }
     
@@ -815,5 +808,121 @@ mod type_parser {
         context.push(TypeAssoc("select".into(), select_ty));
         context.push(TypeAssoc("bool".into(), type_ty.clone()));
         Ok(find_type_rules(rules, &context)?.0)
+    }
+}
+/*
+// mod compiler {
+//     use crate::unify_types::TypedRule;
+//     use std::collections::HashMap;
+//     use std::rc::Rc;
+
+//     pub struct FinalLine(pub usize, pub usize, pub usize);
+
+//     pub fn compile(unified: Vec<TypedRule>) -> (Vec<FinalLine>, Vec<usize>) {
+//         todo!()
+//     }
+// }
+
+// fn print_final_lines(lines: &[FinalLine], outputs: &[usize]) {
+//     println!("0. 0");
+//     println!("1. 1");
+//     println!("2. clock");
+//     println!("3. input0");
+//     println!("4. input1");
+//     println!("5. input2");
+//     println!("6. input3");
+//     println!("7. input4");
+//     println!("8. input5");
+//     println!("9. input6");
+//     println!("10. input7");
+//     for (i, line) in lines.iter().enumerate() {
+//         if let Some(index) = outputs.iter().position(|x| *x == i + 11) {
+//             print!("output {index}: ");
+//         }
+//         println!("{}. select(#{}, #{}, #{})", i + 11, line.0, line.1, line.2);
+//     }
+// }
+
+// enum CompilationError {
+//     ParseError(ParseError),
+//     TypeError(TypeError),
+// }
+
+// impl From<ParseError> for CompilationError {
+//     fn from(err: ParseError) -> CompilationError {
+//         CompilationError::ParseError(err)
+//     }
+// }
+
+// impl From<TypeError> for CompilationError {
+//     fn from(err: TypeError) -> CompilationError {
+//         CompilationError::TypeError(err)
+//     }
+// }
+
+// impl std::fmt::Display for CompilationError {
+//     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+//         match self {
+//             CompilationError::ParseError(err) => write!(formatter, "{}", err),
+//             CompilationError::TypeError(err) => write!(formatter, "{}", err),
+//         }
+//     }
+// }
+
+// fn full_compile(code: &str) -> Result<(Vec<FinalLine>, Vec<usize>), CompilationError> {
+//     let parsed = crate::parser::full_parse(code)?;
+//     let types = find_types(&parsed)?;
+//     let unified = unify(parsed, types);
+//     Ok(compile(unified))
+// }
+
+// fn execute(
+//     code: &[FinalLine],
+//     outputs: &[usize],
+//     inputs: impl IntoIterator<Item = u8>,
+//     ticks: u32,
+// ) -> Vec<Vec<bool>> {
+//     let mut total_values = vec![false; code.len() + 11];
+//     total_values[1] = true;
+//     inputs
+//         .into_iter()
+//         .map(|input| {
+//             for i in 0..8 {
+//                 total_values[i + 3] = (input >> i) & 1 != 0;
+//             }
+//             for _ in 0..100 {
+//                 total_values[2] = !total_values[2];
+//                 for _ in 0..ticks {
+//                     let slice = &code
+//                         .iter()
+//                         .map(|line| {
+//                             total_values[if total_values[line.0] { line.1 } else { line.2 }]
+//                         })
+//                         .collect::<Vec<bool>>();
+//                     total_values[11..(code.len() + 11)].copy_from_slice(slice);
+//                 }
+//             }
+//             outputs.iter().map(|x| total_values[*x]).collect()
+//         })
+//         .collect()
+// }
+*/
+
+fn main() {
+    let string = "
+    a = [true, false];
+    b = {
+        a = 1;
+        b = 2;
+        b
+    };
+    c = (a: bool, b: bool) -> (bool, bool)
+        (select(a, b, false), select(a, false, b));
+    output = c(true, false);
+    ";
+    match full_parse(string).map(find_types) {
+        Ok(Ok(rules)) => println!("{rules:#?}"),
+        Ok(Err(err)) => println!("{err}"),
+        Err(err) => println!("{err}"),
     }
 }
