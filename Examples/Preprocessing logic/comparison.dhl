@@ -3,3 +3,20 @@ type Eq<L: numeral, R: numeral> -> consbool {
     else ifexpr IsZero<R> false
     else Eq<Pred<L>, Pred<R>>
 }
+type Gt<L: numeral, R: numeral> -> consbool {
+    ifexpr IsZero<L> false
+    else ifexpr IsZero<R> true
+    else Gt<Pred<L>, Pred<R>>
+}
+type Lt<L: numeral, R: numeral> -> consbool {
+    Gt<R, L>
+}
+type Ne<L: numeral, R: numeral> -> consbool {
+    Not<Eq<L, R>>
+}
+type Ge<L: numeral, R: numeral> -> consbool {
+    Not<Lt<L, R>>
+}
+type Le<L: numeral, R: numeral> -> consbool {
+    Not<Gt<L, R>>
+}
