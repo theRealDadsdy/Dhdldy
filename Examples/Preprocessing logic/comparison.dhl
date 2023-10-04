@@ -1,0 +1,5 @@
+type Eq<L: numeral, R: numeral> -> consbool {
+    ifexpr IsZero<L> IsZero<R>
+    else ifexpr IsZero<R> false
+    else Eq<Pred<L>, Pred<R>>
+}
