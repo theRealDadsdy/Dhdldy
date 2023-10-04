@@ -1,0 +1,9 @@
+type Not<B: consbool> -> consbool {
+    ifexpr B false else true
+}
+type And<A: consbool, B: consbool> -> consbool {
+    ifexpr A B else false
+}
+type Or<A: consbool, B: consbool> -> consbool {
+    ifexpr A true else B
+}
