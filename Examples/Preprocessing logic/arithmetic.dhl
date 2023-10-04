@@ -1,0 +1,8 @@
+type Pred<N: numeral> -> numeral where Not<IsZero<N>> {
+    I = 0;
+    foreach _: [(); N] {
+        J = I;
+        I = Succ<I>;
+    }
+    J
+}
