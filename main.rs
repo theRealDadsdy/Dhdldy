@@ -1,44 +1,39 @@
+use crate::compiler::compile;
 use crate::parser::full_parse;
-use crate::type_parser::find_types;
 
-trait CallOn: Sized {
-    fn call_on<T>(self, f: impl FnMut(Self) -> T) -> T;
-}
-impl<T: Sized> CallOn for T {
-    fn call_on<U>(self, mut f: impl FnMut(T) -> U) -> U {
-        f(self)
-    }
-}
 mod tokenizer {
     use std::iter::Peekable;
     use std::mem::replace;
     use std::rc::Rc;
     use std::str::Chars;
-    
+
     #[derive(Debug, Clone, Copy)]
     pub enum Keyword {
-        True,
-        False,
+        Boolean(bool),
         FuncDef,
         Map,
         Foreach,
         If,
         Else,
+        Input,
+        Output,
     }
-    
+
     fn get_keyword(string: &str) -> Option<Keyword> {
         match string {
-            "true" => Some(Keyword::True),
-            "false" => Some(Keyword::False),
+            "true" => Some(Keyword::Boolean(true)),
+            "false" => Some(Keyword::Boolean(false)),
             "comp" => Some(Keyword::FuncDef),
             "map" => Some(Keyword::Map),
             "foreach" => Some(Keyword::Foreach),
             "if" => Some(Keyword::If),
             "else" => Some(Keyword::Else),
+            "INPUT" => Some(Keyword::Input),
+            "OUTPUT" => Some(Keyword::Output),
             _ => None,
         }
     }
-    
+
     #[derive(Debug, Clone)]
     pub enum Token {
         OpeningParen,
@@ -66,9 +61,10 @@ mod tokenizer {
     impl std::fmt::Display for Keyword {
         fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
-                Keyword::True => write!(formatter, "true"),
-                Keyword::False => write!(formatter, "false"),
-                a => todo!("{a:?}")
+                Keyword::Boolean(val) => write!(formatter, "{val}"),
+                Keyword::FuncDef => write!(formatter, "comp"),
+                Keyword::Input => write!(formatter, "INPUT"),
+                a => todo!("{a:?}"),
             }
         }
     }
@@ -159,7 +155,7 @@ mod tokenizer {
                             self.0.next();
                             Token::Assoc
                         }
-                        _ => Token::Colon
+                        _ => Token::Colon,
                     },
                     '=' => Token::Equals,
                     '@' => Token::At,
@@ -192,8 +188,7 @@ mod tokenizer {
                                 _ => {
                                     if let Some(keyword) = get_keyword(&name) {
                                         return Ok(Token::Keyword(keyword));
-                                    }
-                                    else {
+                                    } else {
                                         return Ok(Token::Ident(name.into()));
                                     }
                                 }
@@ -222,6 +217,7 @@ mod tokenizer {
     }
 }
 mod parser {
+    use crate::tokenizer::Keyword;
     use crate::tokenizer::Token;
     use crate::tokenizer::TokenError;
     use crate::tokenizer::TokenStream;
@@ -232,7 +228,6 @@ mod parser {
             vec!($(stringify!($pat)),*)
         }
     }
-
     macro_rules! match_token {
         ( $tokens: ident, $( $pat: pat => $expr: expr),* $(,)? ) => {
             match $tokens.token()?{
@@ -255,30 +250,27 @@ mod parser {
     }
 
     #[derive(Debug, Clone, PartialEq)]
-    pub struct Rule(pub Rc<str>, pub Vec<Type>, pub Expression);
+    pub struct Rule(pub Rc<str>, pub Vec<Expression>, pub Expression);
     #[derive(Debug, Clone, PartialEq)]
     pub enum Expression {
+        Boolean(bool),
+        Select(Box<Expression>, Box<Expression>, Box<Expression>),
         VarAccess(Rc<str>),
-        TypedVarAccess(Rc<str>, Type),
-        Circular(Type),
+        TypedVarAccess(Rc<str>, Box<Expression>),
+        Circular(Box<Expression>),
         Tuple(Vec<Expression>),
         Index(Box<Expression>, Index),
         Call(Box<Expression>, Vec<Expression>),
         Block(Vec<Rule>, Box<Expression>),
-        Component(Vec<(Rc<str>, Type)>, Type, Box<Expression>),
-        Number(u128, u32),
+        Component(Vec<(Rc<str>, Expression)>, Box<Expression>, Box<Expression>),
+        Number(u128, Option<u32>),
     }
     #[derive(Debug, Clone, PartialEq)]
     pub enum Index {
         Number(usize),
         Range(usize, usize),
     }
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum Type {
-        Tuple(Vec<Type>),
-        Function(Vec<Type>, Box<Type>),
-        Name(Rc<str>),
-    }
+
     pub enum ParseError {
         TokenError(TokenError),
         UnexpectedToken(Token, Vec<&'static str>, u32),
@@ -310,6 +302,40 @@ mod parser {
         }
     }
 
+    fn try_parse_statement(tokens: &mut TokenStream) -> Option<Result<Rule, ParseError>> {
+        match (tokens.peek(), tokens.peek2()) {
+            (Ok(Token::Ident(_)), Ok(Token::Colon | Token::Equals)) => Some(parse_rule(tokens)),
+            (Ok(Token::Keyword(Keyword::FuncDef)), _) => Some(parse_func_def(tokens)),
+            _ => None,
+        }
+    }
+
+    fn parse_func_def(tokens: &mut TokenStream) -> Result<Rule, ParseError> {
+        assert_token!(tokens, Token::Keyword(Keyword::FuncDef));
+        let name = match_token!(tokens, Token::Ident(name) => name);
+        assert_token!(tokens, Token::OpeningParen);
+        let mut args = vec![];
+        loop {
+            match_token!(tokens,
+                Token::Comma => continue,
+                Token::ClosingParen => break,
+                Token::Ident(name) => {
+                    assert_token!(tokens, Token::Colon);
+                    args.push((name, parse_expression(tokens)?));
+                }
+            )
+        }
+        assert_token!(tokens, Token::Arrow);
+        let ret = parse_expression(tokens)?;
+        assert_token!(tokens, Token::OpeningBrace);
+        let block = parse_block(tokens)?;
+        Ok(Rule(
+            name,
+            vec![],
+            Expression::Component(args, Box::new(ret), Box::new(block)),
+        ))
+    }
+
     fn parse_rule(tokens: &mut TokenStream) -> Result<Rule, ParseError> {
         let name = match_token!(tokens,
             Token::Ident(name) => name,
@@ -317,7 +343,7 @@ mod parser {
         let ty = match tokens.peek()? {
             Token::Colon => {
                 tokens.token()?;
-                Some(parse_type(tokens)?)
+                Some(parse_expression(tokens)?)
             }
             _ => None,
         };
@@ -337,9 +363,13 @@ mod parser {
                     subs.push(*expr);
                     subs.append(&mut exprs);
                 }
-                E::Circular(ty) => reqs.push(ty),
+                E::Circular(ty) => reqs.push(*ty),
                 E::Index(expr, _) => subs.push(*expr),
-                E::Number(..) | E::VarAccess(_) | E::Component(..) | E::Block(..) => (),
+                E::Number(..)
+                | E::VarAccess(_)
+                | E::Component(..)
+                | E::Block(..)
+                | E::Boolean(_) => (),
                 expr => todo!("{expr:?}"),
             }
         }
@@ -348,7 +378,8 @@ mod parser {
 
     fn parse_expression(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
         let mut res = match_token!(tokens,
-            Token::At => Expression::Circular(parse_type(tokens)?),
+            Token::At => Expression::Circular(Box::new(parse_expression(tokens)?)),
+            Token::Keyword(Keyword::Boolean(val)) => Expression::Boolean(val),
             Token::Numeral(num) => {
                 let size = match tokens.peek() {
                     Ok(Token::Ident(string)) => {
@@ -358,16 +389,17 @@ mod parser {
                             return Err(ParseError::InvalidNumeral(num));
                         }
                         tokens.token()?;
-                        last.collect::<String>().parse().map_err(|_| ParseError::InvalidNumeral(num))?
+                        let size = last.collect::<String>().parse().map_err(|_| ParseError::InvalidNumeral(num))?;
+                        if num.checked_shr(size).unwrap_or(0) > 0 {
+                            return Err(ParseError::InvalidNumeral(num));
+                        }
+                        Some(size)
                     }
-                    _ => 8,
+                    _ => None,
                 };
-                if num.checked_shr(size).unwrap_or(0) > 0 {
-                    return Err(ParseError::InvalidNumeral(num));
-                }
                 Expression::Number(num, size)
             },
-            Token::Char(ch) => Expression::Number(ch as u128, 8),
+            Token::Char(ch) => Expression::Number(ch as u128, Some(8)),
             Token::OpeningBracket => parse_array(tokens)?,
             Token::OpeningParen => match (tokens.peek()?, tokens.peek2()?) {
                 (Token::Ident(_), Token::Colon) => parse_component(tokens),
@@ -378,9 +410,9 @@ mod parser {
             Token::Ident(name) => match tokens.peek() {
                 Ok(Token::OpeningAngle) => {
                     tokens.token()?;
-                    let ty = parse_type(tokens)?;
+                    let ty = parse_expression(tokens)?;
                     assert_token!(tokens, Token::ClosingAngle);
-                    Expression::TypedVarAccess(name, ty)
+                    Expression::TypedVarAccess(name, Box::new(ty))
                 }
                 _ => Expression::VarAccess(name),
             },
@@ -484,7 +516,7 @@ mod parser {
     }
 
     fn parse_block(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
-        let rules = parse_rules(tokens)?;
+        let rules = parse_statements(tokens)?;
         let expr = parse_expression(tokens)?;
         assert_token!(tokens, Token::ClosingBrace);
         Ok(Expression::Block(rules, Box::new(expr)))
@@ -496,7 +528,7 @@ mod parser {
             match_token!(tokens,
                 Token::Ident(name) => {
                     assert_token!(tokens, Token::Colon);
-                    args.push((name, parse_type(tokens)?));
+                    args.push((name, parse_expression(tokens)?));
                 },
                 Token::ClosingParen => break,
             );
@@ -506,118 +538,104 @@ mod parser {
             );
         }
         assert_token!(tokens, Token::Arrow);
-        let out = parse_type(tokens)?;
         Ok(Expression::Component(
             args,
-            out,
+            Box::new(parse_expression(tokens)?),
             Box::new(parse_expression(tokens)?),
         ))
     }
 
-    fn parse_type(tokens: &mut TokenStream) -> Result<Type, ParseError> {
-        let (paren, mut ty) = match_token!(tokens,
-            Token::Ident(name) => (false, Type::Name(name)),
-            Token::OpeningParen => (true, parse_type_tuple(tokens)?),
-        );
-
-        loop {
-            ty = match tokens.peek() {
-                Ok(Token::OpeningBracket) => {
-                    tokens.token()?;
-                    let num = match_token!(tokens,
-                        Token::Numeral(num) => num,
-                    );
-                    assert_token!(tokens, Token::ClosingBracket);
-                    let types = vec![ty; num as usize];
-                    Type::Tuple(types)
-                }
-                _ => break,
-            };
-        }
-
-        match tokens.peek() {
-            Ok(Token::Arrow) => {
-                tokens.token()?;
-                let ret = parse_type(tokens)?;
-                Ok(Type::Function(
-                    match (ty, paren) {
-                        (Type::Tuple(types), true) => types,
-                        (ty, _) => vec![ty],
-                    },
-                    Box::new(ret),
-                ))
-            }
-            _ => Ok(ty),
-        }
+    fn parse_statements(tokens: &mut TokenStream) -> Result<Vec<Rule>, ParseError> {
+        std::iter::from_fn(|| try_parse_statement(tokens)).collect()
     }
 
-    fn parse_type_tuple(tokens: &mut TokenStream) -> Result<Type, ParseError> {
-        let mut types = vec![];
-        match tokens.peek() {
-            Ok(Token::ClosingParen) => {
-                tokens.token()?;
-                return Ok(Type::Tuple(types));
-            }
-            _ => {
-                let ty = parse_type(tokens)?;
-                match_token!(tokens,
-                    Token::Comma => types.push(ty),
-                    Token::ClosingParen => return Ok(ty),
-                )
-            }
-        }
-        loop {
-            match tokens.peek() {
-                Ok(Token::ClosingParen) => {
-                    tokens.token()?;
-                    break;
-                }
-                _ => {
-                    types.push(parse_type(tokens)?);
-                    match_token!(tokens,
-                        Token::Comma => (),
-                        Token::ClosingParen => break,
-                    )
-                }
-            }
-        }
-        Ok(Type::Tuple(types))
-    }
+    pub type ParseResult = (Vec<Rc<str>>, Vec<Rc<str>>, Vec<Rule>);
 
-    fn parse_rules(tokens: &mut TokenStream) -> Result<Vec<Rule>, ParseError> {
-        let mut rules = vec![];
-        while let Ok(Token::Equals | Token::Colon) = tokens.peek2() {
-            rules.push(parse_rule(tokens)?);
-        }
-        Ok(rules)
-    }
-
-    pub fn full_parse(string: &str) -> Result<Vec<Rule>, ParseError> {
+    pub fn full_parse(string: &str) -> Result<ParseResult, ParseError> {
         let tokens = &mut TokenStream::new(string);
-        let ret = parse_rules(tokens)?;
+        assert_token!(tokens, Token::Keyword(Keyword::Input));
+        let inputs = std::iter::from_fn(|| {
+            (|| {
+                match_token!(tokens,
+                    Token::Ident(name) => Ok(Some(name)),
+                    Token::Semicolon => Ok(None)
+                )
+            })()
+            .transpose()
+        })
+        .collect::<Result<_, _>>()?;
+        assert_token!(tokens, Token::Keyword(Keyword::Output));
+        let outputs = std::iter::from_fn(|| {
+            (|| {
+                match_token!(tokens,
+                    Token::Ident(name) => Ok(Some(name)),
+                    Token::Semicolon => Ok(None)
+                )
+            })()
+            .transpose()
+        })
+        .collect::<Result<_, _>>()?;
+        let ret = parse_statements(tokens)?;
+        // println!("{:?}", inputs);
+        // println!("{:?}", outputs);
+        // println!("{:?}", ret);
         match tokens.token() {
-            Err(TokenError::EoF) => (),
+            Err(TokenError::EoF) => Ok((inputs, outputs, ret)),
             Ok(token) => Err(ParseError::UnexpectedToken(
                 token,
                 vec!["Token::Identifier"],
                 line!(),
-            ))?,
-            Err(err) => Err(err)?,
+            )),
+            Err(err) => Err(ParseError::TokenError(err)),
         }
-        Ok(ret)
     }
 }
-mod type_parser {
+mod compiler {
     use crate::parser::*;
-    use crate::CallOn;
+    use core::hash::Hash;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Primitive {
+        Type,
+        Bool,
+        Numeral,
+        U(usize),
+    }
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Type {
+        Primitive(Primitive),
+        Tuple(Vec<Type>),
+        Function(Vec<Type>, Box<Type>),
+    }
+    #[derive(Debug, Clone)]
     pub enum TypeError {
         UndefinedIdentifier(Rc<str>),
         CannotIndex(Type),
         CannotCall(Type),
         MismatchedTypes(Type, Type),
         OutOfBoundsIndexing(usize, usize),
+        MissingArgument(Type),
+        ExtraArgument(Type),
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct PartiallyCompiledRule(pub Rc<str>, pub PartiallyCompiledExpression);
+    #[derive(Debug, Clone, PartialEq)]
+    enum PartiallyCompiledExpression {
+        Input(usize),
+        Builtin(Primitive),
+        Boolean(bool),
+        Select(
+            Box<PartiallyCompiledExpression>,
+            Box<PartiallyCompiledExpression>,
+            Box<PartiallyCompiledExpression>,
+        ),
+        // Circular(Type),
+        Tuple(Vec<PartiallyCompiledExpression>),
+        Component(Vec<(Rc<str>, Type)>, Type, Box<Expression>),
+        Number(u128),
     }
 
     impl std::fmt::Display for TypeError {
@@ -626,301 +644,289 @@ mod type_parser {
                 TypeError::UndefinedIdentifier(name) => 
                     write!(formatter, "Undefined Identifier {name}\nNote: {name} may not be defined later in the program than it is used"),
                 TypeError::CannotIndex(ty) => 
-                    write!(formatter, "Cannot index thing of type {ty}"),
+                    write!(formatter, "Cannot index thing of type {ty:?}"),
                 TypeError::CannotCall(ty) => 
-                    write!(formatter, "Cannot call thing of type {ty}"),
+                    write!(formatter, "Cannot call thing of type {ty:?}"),
                 TypeError::MismatchedTypes(type1, type2) => 
-                    write!(formatter, "Expected {type1}, found {type2}"),
+                    write!(formatter, "Expected {type1:?}, found {type2:?}"),
                 TypeError::OutOfBoundsIndexing(len, index) => 
                     write!(formatter, "Index out of bounds: the len is {len} but the index is {index}"),
+                TypeError::MissingArgument(arg) => write!(formatter, "Missing argument of type {arg:?}"),
+                TypeError::ExtraArgument(arg) => write!(formatter, "Extra argument of type {arg:?}"),
             }
         }
     }
 
-    impl std::fmt::Display for Type {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            match self {
-                Type::Name(name) => write!(formatter, "{name}"),
-                Type::Tuple(types) => {
-                    write!(formatter, "(")?;
-                    for ty in types.iter() {
-                        write!(formatter, "{},", ty)?;
-                    }
-                    write!(formatter, ")")
-                }
-                Type::Function(arg, ret) => {
-                    write!(formatter, "(")?;
-                    for ty in arg.iter() {
-                        write!(formatter, "{},", ty)?;
-                    }
-                    write!(formatter, ")")?;
-                    write!(formatter, " -> {ret}")
-                }
-            }
+    type Context = HashMap<Rc<str>, Vec<PartiallyCompiledExpression>>;
+
+    fn add_to_context<U, T>(id: U, val: T, context: &mut HashMap<U, Vec<T>>)
+    where
+        U: Eq + Hash,
+    {
+        if let Some(ref mut parts) = context.get_mut(&id) {
+            parts.push(val);
+        } else {
+            context.insert(id, vec![val]);
         }
     }
 
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TypedRule(pub Rc<str>, pub TypedExpr);
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct TypedExpr(pub Type, pub TypedExpression);
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum TypedExpression {
-        VarAccess(Rc<str>),
-        Circular,
-        Tuple(Vec<TypedExpr>),
-        Index(Box<TypedExpr>, Index),
-        Call(Box<TypedExpr>, Vec<TypedExpr>),
-        Block(Vec<TypedRule>, Box<TypedExpr>),
-        Component(Vec<Rc<str>>, Box<TypedExpr>),
-        Number(u128, u32),
-    }
-    #[derive(Debug, Clone)]
-    struct TypeAssoc(Rc<str>, Type);
-
-    fn find_types_rule(rule: Rule, context: &[TypeAssoc]) -> Result<TypedRule, TypeError> {
-        let expr = find_types_expr(rule.2, context)?;
-        if let Some(ty) = rule.1.into_iter().find(|x| x != &expr.0) {
-            return Err(TypeError::MismatchedTypes(ty, expr.0));
+    fn find_type(expr: &PartiallyCompiledExpression) -> Type {
+        use PartiallyCompiledExpression as PCE;
+        match expr {
+            PCE::Input(_) => Type::Primitive(Primitive::Bool),
+            PCE::Boolean(_) => Type::Primitive(Primitive::Bool),
+            PCE::Number(_) => Type::Primitive(Primitive::Numeral),
+            PCE::Tuple(exprs) => Type::Tuple(exprs.iter().map(find_type).collect()),
+            PCE::Component(args, ret, _) => Type::Function(
+                args.iter().map(|x| x.1.clone()).collect(),
+                Box::new(ret.clone()),
+            ),
+            PCE::Select(_, _, _) => Type::Primitive(Primitive::Bool),
+            expr => todo!("{expr:#?}"),
         }
-        Ok(TypedRule(rule.0, expr))
     }
 
-    fn find_types_expr(expr: Expression, context: &[TypeAssoc]) -> Result<TypedExpr, TypeError> {
-        use Expression as E;
-        use TypedExpr as T;
-        use TypedExpression as TE;
+    fn evaluate_type(expr: PartiallyCompiledExpression) -> Result<Type, TypeError> {
+        use PartiallyCompiledExpression as PCE;
         Ok(match expr {
-            E::Number(val, size) => T(
-                Type::Tuple(vec![Type::Name("bool".into()); size as usize]),
-                TE::Number(val, size),
+            PCE::Builtin(prim) => Type::Primitive(prim),
+            PCE::Tuple(exprs) => Type::Tuple(
+                exprs
+                    .into_iter()
+                    .map(evaluate_type)
+                    .collect::<Result<_, _>>()?,
             ),
-            E::VarAccess(name) => T(
-                find_types_var(name.clone(), context, |_| true)?,
-                TE::VarAccess(name),
-            ),
-            E::Index(expr, index) => match find_types_expr(*expr, context)? {
-                T(Type::Tuple(types), expr) => T(
-                    match index {
-                        Index::Number(num) => {
-                            if num >= types.len() {
-                                return Err(TypeError::OutOfBoundsIndexing(types.len(), num));
-                            }
-                            types[num].clone()
-                        }
-                        Index::Range(start, end) => {
-                            let reverse = start < end;
-                            let (min, max) = if reverse { (start, end) } else { (end, start) };
-                            if max >= types.len() {
-                                return Err(TypeError::OutOfBoundsIndexing(types.len(), max));
-                            }
-                            let types = types[min..=max].to_vec();
-                            Type::Tuple(if reverse {
-                                types
-                            } else {
-                                types.into_iter().rev().collect()
-                            })
-                        }
-                    },
-                    TE::Index(Box::new(T(Type::Tuple(types), expr)), index),
-                ),
-                T(ty, _) => return Err(TypeError::CannotIndex(ty)),
-            },
-            E::Tuple(exprs) => exprs
-                .into_iter()
-                .map(|x| find_types_expr(x, context))
-                .collect::<Result<Vec<_>, _>>()?
-                .call_on(|x| {
-                    T(
-                        Type::Tuple(x.iter().map(|x| x.0.clone()).collect()),
-                        TE::Tuple(x),
-                    )
-                }),
-            E::Circular(ty) => T(ty, TE::Circular),
-            E::Call(func, args) => match find_types_expr(*func, context)? {
-                ref expr @ T(Type::Function(ref arg, ref ret), _) => {
-                    let args: Vec<_> = args
-                        .into_iter()
-                        .map(|x| find_types_expr(x, context))
-                        .collect::<Result<_, _>>()?;
-                    if let Some((ty1, ty2)) = args.iter().zip(arg).find(|x| &x.0 .0 != x.1) {
-                        return Err(TypeError::MismatchedTypes(ty2.clone(), ty1.0.clone()));
-                    }
-                    T(*ret.clone(), TE::Call(Box::new(expr.clone()), args))
-                }
-                T(ty, _) => return Err(TypeError::CannotCall(ty)),
-            },
-            E::Block(rules, expr) => {
-                let (rules, context) = find_type_rules(rules, context)?;
-                let expr = find_types_expr(*expr, &context)?;
-                T(expr.0.clone(), TE::Block(rules, Box::new(expr)))
-            }
-            E::Component(args, ret, expr) => {
-                let mut context = context.to_vec();
-                context.extend(args.iter().cloned().map(|x| TypeAssoc(x.0, x.1)));
-                // println!("{context:?}");
-                let expr = find_types_expr(*expr, &context)?;
-                if ret != expr.0 {
-                    return Err(TypeError::MismatchedTypes(expr.0, ret));
-                }
-                let args = args.into_iter().unzip();
-                T(
-                    Type::Function(args.1, Box::new(ret)),
-                    TE::Component(args.0, Box::new(expr)),
-                )
-            }
-            a => todo!("{a:?}"),
+            expr => todo!("{expr:#?}"),
         })
     }
 
-    fn find_types_var(
-        name: Rc<str>,
-        context: &[TypeAssoc],
-        predicate: impl Fn(&Type) -> bool,
-    ) -> Result<Type, TypeError> {
-        for assoc in context.iter().rev() {
-            if assoc.0 == name && predicate(&assoc.1) {
-                return Ok(assoc.1.clone());
-            }
-        }
-        Err(TypeError::UndefinedIdentifier(name))
+    fn reduce_expr(
+        expr: Expression,
+        context: &Context,
+    ) -> Result<PartiallyCompiledExpression, TypeError> {
+        use Expression as E;
+        use PartiallyCompiledExpression as PCE;
+        Ok(match expr {
+            E::Boolean(val) => PCE::Boolean(val),
+            E::Number(val, size) => match size {
+                Some(size) => PCE::Tuple(
+                    (0..size)
+                        .map(|x| (val >> x) != 0)
+                        .map(PCE::Boolean)
+                        .collect(),
+                ),
+                None => PCE::Number(val),
+            },
+            E::VarAccess(name) => context
+                .get(&name)
+                .and_then(|x| x.last())
+                .ok_or(TypeError::UndefinedIdentifier(name))?
+                .clone(),
+            E::Select(a, b, c) => PCE::Select(
+                Box::new(reduce_expr(*a, context)?),
+                Box::new(reduce_expr(*b, context)?),
+                Box::new(reduce_expr(*c, context)?)
+            ),
+            // E::Circular(ty) => PCE::Circular(reduce_expr(*ty, context).and_then(evaluate_type)?),
+            E::Tuple(exprs) => PCE::Tuple(
+                exprs
+                    .into_iter()
+                    .map(|x| reduce_expr(x, context))
+                    .collect::<Result<_, _>>()?,
+            ),
+            E::Index(expr, index) => match reduce_expr(*expr, context)? {
+                PCE::Tuple(mut exprs) => match index {
+                    Index::Number(index) => {
+                        if index >= exprs.len() {
+                            return Err(TypeError::OutOfBoundsIndexing(index, exprs.len()));
+                        }
+                        exprs.swap_remove(index)
+                    }
+                    Index::Range(_start, _end) => todo!(),
+                },
+                // expr => todo!("{expr:?}"),
+                expr => return Err(TypeError::CannotIndex(find_type(&expr))),
+            },
+            E::Block(rules, expr) => reduce_block(rules, *expr, context)?,
+            E::Call(func, args) => reduce_call(*func, args, context)?,
+            E::Component(args, ret, expr) => PCE::Component(
+                args.into_iter()
+                    .map(|(n, x)| {
+                        reduce_expr(x, context)
+                            .and_then(evaluate_type)
+                            .map(|x| (n, x))
+                    })
+                    .collect::<Result<_, _>>()?,
+                reduce_expr(*ret, context).and_then(evaluate_type)?,
+                expr,
+            ),
+            expr => todo!("{expr:#?}\n{context:?}"),
+        })
     }
 
-    fn find_type_rules(
+    fn reduce_call(
+        func: Expression,
+        args: Vec<Expression>,
+        context: &Context,
+    ) -> Result<PartiallyCompiledExpression, TypeError> {
+        let ((arg_names, mut arg_types), ret, expr): ((Vec<_>, Vec<_>), _, _) = match reduce_expr(func, context)? {
+            PartiallyCompiledExpression::Component(a, b, c) => (a.into_iter().unzip(), b, *c),
+            expr => return Err(TypeError::CannotCall(find_type(&expr))),
+        };
+        if arg_types.len() > args.len() {
+            return Err(TypeError::MissingArgument(arg_types.swap_remove(args.len())));
+        }
+        let args = args
+            .into_iter()
+            .map(|x| reduce_expr(x, context))
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.len() > arg_types.len() {
+            return Err(TypeError::ExtraArgument(find_type(&args[arg_types.len()])));
+        }
+        if let Some((t1, t2)) = arg_types
+            .into_iter()
+            .zip(args.iter().map(find_type))
+            .find(|(x, y)| x != y)
+        {
+            return Err(TypeError::MismatchedTypes(t1, t2));
+        }
+        let mut context = context.clone();
+        arg_names
+            .into_iter()
+            .zip(args)
+            .for_each(|(n, v)| add_to_context(n, v, &mut context));
+        let expr = reduce_expr(expr, &context)?;
+        let ret_actual = find_type(&expr);
+        if ret_actual != ret {
+            return Err(TypeError::MismatchedTypes(ret_actual, ret))
+        }
+        Ok(expr)
+    }
+
+    fn reduce_block(
         rules: Vec<Rule>,
-        context: &[TypeAssoc],
-    ) -> Result<(Vec<TypedRule>, Vec<TypeAssoc>), TypeError> {
-        let mut context = context.to_vec();
-        let mut typed_rules = vec![];
-        for rule in rules {
-            let type_rule = find_types_rule(rule, &context)?;
-            context.push(TypeAssoc(type_rule.0.clone(), type_rule.1 .0.clone()));
-            typed_rules.push(type_rule);
-        }
-        Ok((typed_rules, context))
+        expr: Expression,
+        context: &Context,
+    ) -> Result<PartiallyCompiledExpression, TypeError> {
+        let mut context = context.clone();
+        reduce_rules(rules, &mut context)?;
+        reduce_expr(expr, &context)
     }
 
-    pub fn find_types(rules: Vec<Rule>) -> Result<Vec<TypedRule>, TypeError> {
-        let mut context = vec![];
-        let bool_ty = Type::Name("bool".into());
-        let type_ty = Type::Name("type".into());
-        let select_ty = Type::Function(vec![bool_ty.clone(); 3], Box::new(bool_ty.clone()));
-        context.push(TypeAssoc("select".into(), select_ty));
-        context.push(TypeAssoc("bool".into(), type_ty.clone()));
-        Ok(find_type_rules(rules, &context)?.0)
+    fn reduce_rules(
+        rules: Vec<Rule>,
+        context: &mut Context,
+    ) -> Result<(), TypeError> {
+        rules
+            .into_iter()
+            .map(|x| {
+                let mut reqs =
+                    x.1.into_iter()
+                        .map(|x| reduce_expr(x, &*context).and_then(evaluate_type));
+                let expr = reduce_expr(x.2, &*context)?;
+                let expr_type = find_type(&expr);
+                if let Some(t) = reqs.find(|x| x.as_ref().map_or(true, |x| x != &expr_type)) {
+                    t.map(|x| Err(TypeError::MismatchedTypes(x, expr_type)))??;
+                }
+                add_to_context(x.0, expr, context);
+                Ok(())
+            })
+            .collect()
+    }
+
+    fn reduce(
+        rules: Vec<Rule>,
+        inputs: Vec<Rc<str>>,
+    ) -> Result<Context, TypeError> {
+        use PartiallyCompiledExpression as PCE;
+        let mut context = HashMap::with_capacity(inputs.len() + 3);
+        inputs
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, x)| add_to_context(x, PCE::Input(i), &mut context));
+        add_to_context("bool".into(), PCE::Builtin(Primitive::Bool), &mut context);
+        add_to_context("type".into(), PCE::Builtin(Primitive::Type), &mut context);
+        add_to_context(
+            "select".into(),
+            PCE::Component(
+                vec![
+                    ("a".into(), Type::Primitive(Primitive::Bool)),
+                    ("b".into(), Type::Primitive(Primitive::Bool)),
+                    ("c".into(), Type::Primitive(Primitive::Bool)),
+                ],
+                Type::Primitive(Primitive::Bool),
+                Box::new(Expression::Select(
+                    Box::new(Expression::VarAccess("a".into())),
+                    Box::new(Expression::VarAccess("b".into())),
+                    Box::new(Expression::VarAccess("c".into())),
+                )),
+            ),
+            &mut context,
+        );
+        reduce_rules(rules, &mut context)?;
+        Ok(context)
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum Value {
+        Boolean(bool),
+        Input(usize),
+        Select(Box<Value>, Box<Value>, Box<Value>)
+    }
+
+    fn resolve_expr(expr: PartiallyCompiledExpression) -> Result<Value, TypeError> {
+        use PartiallyCompiledExpression as PCE;
+        use Value as V;
+        Ok(match expr {
+            PCE::Boolean(val) => V::Boolean(val),
+            PCE::Input(val) => V::Input(val),
+            PCE::Select(a, b, c) => match resolve_expr(*a)? {
+                V::Boolean(val) => if val {
+                    resolve_expr(*b)?
+                } else {
+                    resolve_expr(*c)?
+                },
+                a => V::Select(
+                    Box::new(a),
+                    Box::new(resolve_expr(*b)?),
+                    Box::new(resolve_expr(*c)?)
+                ),
+            },
+            expr => todo!("{expr:#?}"),
+        })
+    }
+
+    fn resolve(
+        mut rules: Context,
+        outputs: Vec<Rc<str>>,
+    ) -> Result<Vec<Value>, TypeError> {
+        outputs.into_iter().map(|x| match rules.remove(&x).and_then(|mut x| x.pop()) {
+            Some(expr) => resolve_expr(expr),
+            None => Err(TypeError::UndefinedIdentifier(x)),
+        }).collect()
+    }
+
+    pub fn compile((inputs, outputs, statements): ParseResult) -> Result<Vec<Value>, TypeError> {
+        resolve(reduce(statements, inputs)?, outputs)
     }
 }
-/*
-// mod compiler {
-//     use crate::unify_types::TypedRule;
-//     use std::collections::HashMap;
-//     use std::rc::Rc;
-
-//     pub struct FinalLine(pub usize, pub usize, pub usize);
-
-//     pub fn compile(unified: Vec<TypedRule>) -> (Vec<FinalLine>, Vec<usize>) {
-//         todo!()
-//     }
-// }
-
-// fn print_final_lines(lines: &[FinalLine], outputs: &[usize]) {
-//     println!("0. 0");
-//     println!("1. 1");
-//     println!("2. clock");
-//     println!("3. input0");
-//     println!("4. input1");
-//     println!("5. input2");
-//     println!("6. input3");
-//     println!("7. input4");
-//     println!("8. input5");
-//     println!("9. input6");
-//     println!("10. input7");
-//     for (i, line) in lines.iter().enumerate() {
-//         if let Some(index) = outputs.iter().position(|x| *x == i + 11) {
-//             print!("output {index}: ");
-//         }
-//         println!("{}. select(#{}, #{}, #{})", i + 11, line.0, line.1, line.2);
-//     }
-// }
-
-// enum CompilationError {
-//     ParseError(ParseError),
-//     TypeError(TypeError),
-// }
-
-// impl From<ParseError> for CompilationError {
-//     fn from(err: ParseError) -> CompilationError {
-//         CompilationError::ParseError(err)
-//     }
-// }
-
-// impl From<TypeError> for CompilationError {
-//     fn from(err: TypeError) -> CompilationError {
-//         CompilationError::TypeError(err)
-//     }
-// }
-
-// impl std::fmt::Display for CompilationError {
-//     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-//         match self {
-//             CompilationError::ParseError(err) => write!(formatter, "{}", err),
-//             CompilationError::TypeError(err) => write!(formatter, "{}", err),
-//         }
-//     }
-// }
-
-// fn full_compile(code: &str) -> Result<(Vec<FinalLine>, Vec<usize>), CompilationError> {
-//     let parsed = crate::parser::full_parse(code)?;
-//     let types = find_types(&parsed)?;
-//     let unified = unify(parsed, types);
-//     Ok(compile(unified))
-// }
-
-// fn execute(
-//     code: &[FinalLine],
-//     outputs: &[usize],
-//     inputs: impl IntoIterator<Item = u8>,
-//     ticks: u32,
-// ) -> Vec<Vec<bool>> {
-//     let mut total_values = vec![false; code.len() + 11];
-//     total_values[1] = true;
-//     inputs
-//         .into_iter()
-//         .map(|input| {
-//             for i in 0..8 {
-//                 total_values[i + 3] = (input >> i) & 1 != 0;
-//             }
-//             for _ in 0..100 {
-//                 total_values[2] = !total_values[2];
-//                 for _ in 0..ticks {
-//                     let slice = &code
-//                         .iter()
-//                         .map(|line| {
-//                             total_values[if total_values[line.0] { line.1 } else { line.2 }]
-//                         })
-//                         .collect::<Vec<bool>>();
-//                     total_values[11..(code.len() + 11)].copy_from_slice(slice);
-//                 }
-//             }
-//             outputs.iter().map(|x| total_values[*x]).collect()
-//         })
-//         .collect()
-// }
-*/
 
 fn main() {
     let string = "
-    a = [true, false];
+    INPUT in1 in2;
+    OUTPUT out;
+    a = [in1, in2];
     b = {
-        a = 1;
-        b = 2;
+        b = a;
+        a = false;
         b
     };
-    c = (a: bool, b: bool) -> (bool, bool)
-        (select(a, b, false), select(a, false, b));
-    output = c(true, false);
+    comp c(d: bool) -> (bool, bool) {
+        (select(d, b[0], false), select(d, false, b[0]))
+    }
+    out: bool = c(true)[1];
     ";
-    match full_parse(string).map(find_types) {
+    match full_parse(string).map(compile) {
         Ok(Ok(rules)) => println!("{rules:#?}"),
         Ok(Err(err)) => println!("{err}"),
         Err(err) => println!("{err}"),
