@@ -284,7 +284,12 @@ mod parser {
         Index(Box<Expression>, Index),
         Call(Box<Expression>, Vec<Expression>),
         Block(Vec<Rule>, Box<Expression>),
-        Component(Vec<(Rc<str>, Expression)>, Vec<Rc<str>>, Box<Expression>, Box<Expression>),
+        Component(
+            Vec<(Rc<str>, Expression)>,
+            Vec<Rc<str>>,
+            Box<Expression>,
+            Box<Expression>,
+        ),
         CompType(Vec<Expression>, Box<Expression>),
         Number(u128, Option<u32>),
     }
@@ -605,7 +610,9 @@ mod parser {
             );
         }
         Ok(Expression::Component(
-            args.into_iter().map(|x| (x, Expression::VarAccess("any".into()))).collect(),
+            args.into_iter()
+                .map(|x| (x, Expression::VarAccess("any".into())))
+                .collect(),
             vec![],
             Box::new(Expression::VarAccess("any".into())),
             Box::new(parse_expression(tokens)?),
@@ -707,7 +714,10 @@ mod compiler {
             self.try_match(other).is_some()
         }
     }
-    fn try_join(mut first: HashMap<Rc<str>, Type>, second: HashMap<Rc<str>, Type>) -> Option<HashMap<Rc<str>, Type>> {
+    fn try_join(
+        mut first: HashMap<Rc<str>, Type>,
+        second: HashMap<Rc<str>, Type>,
+    ) -> Option<HashMap<Rc<str>, Type>> {
         for (key, value) in second {
             if first.contains_key(&key) && first.get(&key) != Some(&value) {
                 return None;
@@ -742,15 +752,11 @@ mod compiler {
                 return Some(std::iter::once((name.clone(), other.clone())).collect());
             }
             if let Type::Generic(name) = other {
-                return Some(
-                    std::iter::once((name.clone(), self.clone()))
-                        .into_iter()
-                        .collect(),
-                );
+                return Some(std::iter::once((name.clone(), self.clone())).collect());
             }
             match self {
                 Type::Primitive(prim1) => match other {
-                    Type::Primitive(prim2) => (prim1 == prim2).then(|| (HashMap::new())),
+                    Type::Primitive(prim2) => (prim1 == prim2).then(HashMap::new),
                     _ => None,
                 },
                 Type::Tuple(types1) => match other {
@@ -926,7 +932,9 @@ mod compiler {
                 args.into_iter()
                     .map(|x| reduce_expr(x, context).and_then(evaluate_type))
                     .collect::<Result<_, _>>()?,
-                reduce_expr(*ret, context).and_then(evaluate_type).map(Box::new)?,
+                reduce_expr(*ret, context)
+                    .and_then(evaluate_type)
+                    .map(Box::new)?,
             )),
             E::Tuple(exprs) => PCE::Tuple(
                 exprs
@@ -951,7 +959,11 @@ mod compiler {
             E::Call(func, args) => reduce_call(*func, args, context)?,
             E::Component(args, generics, ret, expr) => {
                 let mut context = context.clone();
-                context.extend(generics.into_iter().map(|x| (x.clone(), vec![PCE::Type(Type::Generic(x))])));
+                context.extend(
+                    generics
+                        .into_iter()
+                        .map(|x| (x.clone(), vec![PCE::Type(Type::Generic(x))])),
+                );
                 PCE::Component(
                     args.into_iter()
                         .map(|(n, x)| {
@@ -999,12 +1011,13 @@ mod compiler {
             return Err(TypeError::ExtraArgument(find_type(&args[arg_types.len()])));
         }
         let mut resolved = HashMap::new();
-        for (t1, t2) in arg_types
-            .into_iter()
-            .zip(args.iter().map(find_type)) {
+        for (t1, t2) in arg_types.into_iter().zip(args.iter().map(find_type)) {
             let t1 = t1.fill_in(&resolved);
             let t2 = t2.fill_in(&resolved);
-            resolved = t1.try_match(&t2).and_then(|x| try_join(resolved, x)).ok_or(TypeError::MismatchedTypes(t1, t2))?;
+            resolved = t1
+                .try_match(&t2)
+                .and_then(|x| try_join(resolved, x))
+                .ok_or(TypeError::MismatchedTypes(t1, t2))?;
         }
         let ret = ret.fill_in(&resolved);
         let mut context = context.clone();
@@ -1012,7 +1025,9 @@ mod compiler {
             .into_iter()
             .zip(args)
             .for_each(|(n, v)| add_to_context(n, v, &mut context));
-        resolved.into_iter().for_each(|(n, t)| add_to_context(n, PartiallyCompiledExpression::Type(t), &mut context));
+        resolved.into_iter().for_each(|(n, t)| {
+            add_to_context(n, PartiallyCompiledExpression::Type(t), &mut context)
+        });
         let expr = reduce_expr(expr, &context)?;
         let ret_actual = find_type(&expr);
         if ret != ret_actual {
@@ -1055,8 +1070,16 @@ mod compiler {
             .for_each(|(i, x)| add_to_context(x, PCE::Input(i), &mut context));
         add_to_context("false".into(), PCE::Boolean(false), &mut context);
         add_to_context("true".into(), PCE::Boolean(true), &mut context);
-        add_to_context("bool".into(), PCE::Type(Primitive::Bool.into()), &mut context);
-        add_to_context("type".into(), PCE::Type(Primitive::Type.into()), &mut context);
+        add_to_context(
+            "bool".into(),
+            PCE::Type(Primitive::Bool.into()),
+            &mut context,
+        );
+        add_to_context(
+            "type".into(),
+            PCE::Type(Primitive::Type.into()),
+            &mut context,
+        );
         add_to_context("any".into(), PCE::Type(Type::Any), &mut context);
         add_to_context(
             "select".into(),
