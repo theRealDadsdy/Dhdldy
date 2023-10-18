@@ -771,7 +771,10 @@ mod compiler {
                     }
                     _ => None,
                 },
-                Type::Function(_args, _ret) => todo!(),
+                Type::Function(_args1, _ret1) => match other {
+                    Type::Function(_args2, _ret2) => todo!(),
+                    _ => None,
+                },
                 Type::Generic(_) | Type::Any => unreachable!(),
             }
         }
