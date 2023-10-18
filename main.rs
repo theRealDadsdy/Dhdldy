@@ -771,8 +771,18 @@ mod compiler {
                     }
                     _ => None,
                 },
-                Type::Function(_args1, _ret1) => match other {
-                    Type::Function(_args2, _ret2) => todo!(),
+                Type::Function(args1, ret1) => match other {
+                    Type::Function(args2, ret2) => {
+                        let mut hashmap = HashMap::new();
+                        for (ty1, ty2) in args1.iter().zip(args2) {
+                            let ty1 = ty1.clone().fill_in(&hashmap);
+                            let ty2 = ty2.clone().fill_in(&hashmap);
+                            hashmap = ty1.try_match(&ty2).and_then(|x| try_join(hashmap, x))?;
+                        }
+                        let ret1 = ret1.clone().fill_in(&hashmap);
+                        let ret2 = ret2.clone().fill_in(&hashmap);
+                        ret1.try_match(&ret2).and_then(|x| try_join(hashmap, x))
+                    },
                     _ => None,
                 },
                 Type::Generic(_) | Type::Any => unreachable!(),
@@ -1183,11 +1193,10 @@ fn main() {
     let string = "
     INPUT;
     OUTPUT o;
-    comp typeof<N>(val: N) -> type {
-        N
+    comp call<T>(func: comp()->T) -> T {
+        func()
     }
-    ty = typeof(|| false);
-    o: ty = false;
+    o = call(|| false);
     ";
     match full_parse(string).map(compile) {
         Ok(Ok(rules)) => println!("{rules:#?}"),
