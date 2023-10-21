@@ -242,6 +242,7 @@ mod tokenizer {
 }
 mod parser {
     use crate::tokenizer::{Keyword, Token, TokenError, TokenStream};
+    use std::iter;
     use std::rc::Rc;
 
     macro_rules! pat_names {
@@ -271,12 +272,13 @@ mod parser {
     }
 
     #[derive(Debug, Clone, PartialEq)]
-    pub struct Rule(pub Rc<str>, pub Vec<Expression>, pub Expression);
+    pub struct Rule(pub Rc<str>, pub Vec<Expression>, pub bool, pub Expression);
     #[derive(Debug, Clone, PartialEq)]
     pub enum Expression {
         String(String),
         Error(String),
         Select(Box<Expression>, Box<Expression>, Box<Expression>),
+        Map(Rc<str>, Box<Expression>, Box<Expression>),
         VarAccess(Rc<str>),
         TypedVarAccess(Rc<str>, Box<Expression>),
         Circular(Box<Expression>),
@@ -339,7 +341,7 @@ mod parser {
                 (|| {
                     let error = parse_expression(tokens)?;
                     assert_token!(tokens, Token::Semicolon);
-                    Ok(Rule("*".into(), vec![], error))
+                    Ok(Rule("*".into(), vec![], false, error))
                 })()
             }),
             (Ok(Token::Keyword(Keyword::TypeDef)), _) => Some(parse_typedef(tokens)),
@@ -354,7 +356,7 @@ mod parser {
         let name = match_token!(tokens, Token::Ident(name) => name);
         let expr = Expression::Typedef(Box::new(parse_expression(tokens)?));
         assert_token!(tokens, Token::Semicolon);
-        Ok(Rule(name, vec![], expr))
+        Ok(Rule(name, vec![], false, expr))
     }
 
     fn parse_func_def(tokens: &mut TokenStream) -> Result<Rule, ParseError> {
@@ -392,6 +394,7 @@ mod parser {
         Ok(Rule(
             name,
             vec![],
+            false,
             Expression::Component(args, generics, Box::new(ret), Box::new(block)),
         ))
     }
@@ -415,6 +418,7 @@ mod parser {
             Some(ty) => vec![ty],
             None => vec![],
         };
+        let mut circ = false;
         while let Some(expr) = subs.pop() {
             use crate::parser::Expression as E;
             match expr {
@@ -423,7 +427,10 @@ mod parser {
                     subs.push(*expr);
                     subs.append(&mut exprs);
                 }
-                E::Circular(ty) => reqs.push(*ty),
+                E::Circular(ty) => {
+                    reqs.push(*ty);
+                    circ = true;
+                }
                 E::Index(expr, _) => subs.push(*expr),
                 E::Unwrap(expr) => subs.push(*expr),
                 E::TypedVarAccess(_, expr) => subs.push(*expr),
@@ -439,14 +446,19 @@ mod parser {
                     subs.push(*ret);
                     subs.push(*expr);
                 }
+                E::Map(_, expr, body) => {
+                    subs.push(*expr);
+                    subs.push(*body);
+                }
                 E::Error(_) | E::Number(..) | E::String(_) | E::VarAccess(_) | E::Block(..) => (),
             }
         }
-        Ok(Rule(name, reqs, expr))
+        Ok(Rule(name, reqs, circ, expr))
     }
 
     fn parse_expression(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
         let mut res = match_token!(tokens,
+            Token::Keyword(Keyword::Map) => parse_map(tokens)?,
             Token::String(string) => Expression::String(string),
             Token::Keyword(Keyword::Error) => Expression::Error(match_token!(tokens, Token::String(string)=>string)),
             Token::Keyword(Keyword::FuncDef) => Expression::CompType(
@@ -517,6 +529,14 @@ mod parser {
                 _ => return Ok(res),
             }
         }
+    }
+
+    fn parse_map(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
+        let name = match_token!(tokens, Token::Ident(name) => name);
+        assert_token!(tokens, Token::Colon);
+        let expr = parse_expression(tokens)?;
+        let body = parse_expression(tokens)?;
+        Ok(Expression::Map(name, Box::new(expr), Box::new(body)))
     }
 
     fn parse_array(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
@@ -644,44 +664,70 @@ mod parser {
     }
 
     fn parse_statements(tokens: &mut TokenStream) -> Result<Vec<Rule>, ParseError> {
-        std::iter::from_fn(|| try_parse_statement(tokens)).collect()
+        iter::from_fn(|| try_parse_statement(tokens)).collect()
     }
 
-    pub type ParseResult = (Vec<Rc<str>>, Vec<Rc<str>>, Vec<Rule>);
+    #[derive(Clone)]
+    pub enum Structure {
+        Tuple(Vec<Structure>),
+        Value,
+    }
+
+    pub type ParseResult = (
+        Vec<(Rc<str>, Structure)>,
+        Vec<(Rc<str>, Structure)>,
+        Vec<Rule>,
+    );
 
     pub fn full_parse(string: &str) -> Result<ParseResult, ParseError> {
         let tokens = &mut TokenStream::new(string);
         assert_token!(tokens, Token::Keyword(Keyword::Input));
-        let inputs = std::iter::from_fn(|| {
-            (|| {
-                match_token!(tokens,
-                    Token::Ident(name) => Ok(Some(name)),
-                    Token::Semicolon => Ok(None)
-                )
-            })()
-            .transpose()
-        })
-        .collect::<Result<_, _>>()?;
+        let mut inputs = vec![];
+        loop {
+            match_token!(tokens,
+                Token::Ident(name) => inputs.push((
+                    name,
+                    {
+                        let mut curr = Structure::Value;
+                        while let Ok(Token::OpeningBracket) = tokens.peek(){
+                            assert_token!(tokens, Token::OpeningBracket);
+                            curr = Structure::Tuple(vec![curr; match_token!(tokens, Token::Numeral(num) => num as usize)]);
+                            assert_token!(tokens, Token::ClosingBracket);
+                        }
+                        curr
+                    },
+                )),
+                Token::Semicolon => break,
+            )
+        }
         let (outputs, ret) = match tokens.peek() {
             Ok(Token::Keyword(Keyword::Output)) => {
                 assert_token!(tokens, Token::Keyword(Keyword::Output));
-                let outputs = std::iter::from_fn(|| {
-                    (|| {
-                        match_token!(tokens,
-                            Token::Ident(name) => Ok(Some(name)),
-                            Token::Semicolon => Ok(None)
-                        )
-                    })()
-                    .transpose()
-                })
-                .collect::<Result<_, _>>()?;
+                let mut outputs = vec![];
+                loop {
+                    match_token!(tokens,
+                        Token::Ident(name) => outputs.push((
+                            name,
+                            {
+                                let mut curr = Structure::Value;
+                                while let Ok(Token::OpeningBracket) = tokens.peek(){
+                                    assert_token!(tokens, Token::OpeningBracket);
+                                    curr = Structure::Tuple(vec![curr; match_token!(tokens, Token::Numeral(num) => num as usize)]);
+                                    assert_token!(tokens, Token::ClosingBracket);
+                                }
+                                curr
+                            },
+                        )),
+                        Token::Semicolon => break,
+                    )
+                }
                 let ret = parse_statements(tokens)?;
                 (outputs, ret)
             }
             _ => {
                 let ret = parse_statements(tokens)?;
                 assert_token!(tokens, Token::Keyword(Keyword::Output));
-                let outputs = std::iter::from_fn(|| {
+                let outputs = iter::from_fn(|| {
                     (|| {
                         match_token!(tokens,
                             Token::Ident(name) => Ok(Some(name)),
@@ -690,6 +736,7 @@ mod parser {
                     })()
                     .transpose()
                 })
+                .map(|x| x.map(|x| (x, Structure::Value)))
                 .collect::<Result<_, _>>()?;
                 (outputs, ret)
             }
@@ -712,7 +759,10 @@ mod compiler {
     use crate::parser::*;
     use std::collections::HashMap;
     use std::hash::Hash;
+    use std::iter;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LABELS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub enum Primitive {
@@ -774,10 +824,10 @@ mod compiler {
                 return Some(HashMap::new());
             }
             if let Type::Generic(name) = self {
-                return Some(std::iter::once((name.clone(), other.clone())).collect());
+                return Some(iter::once((name.clone(), other.clone())).collect());
             }
             if let Type::Generic(name) = other {
-                return Some(std::iter::once((name.clone(), self.clone())).collect());
+                return Some(iter::once((name.clone(), self.clone())).collect());
             }
             match self {
                 Type::Primitive(prim1) => match other {
@@ -829,7 +879,6 @@ mod compiler {
         MissingArgument(Type),
         ExtraArgument(Type),
     }
-
     impl std::fmt::Display for TypeError {
         fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self{
@@ -857,6 +906,7 @@ mod compiler {
         Boolean(bool),
         Number(u128),
         Type(Type),
+        Label(usize, Box<PartiallyCompiledExpression>),
         Circular(Type, usize),
         Wrap(usize, Box<PartiallyCompiledExpression>),
         Select(
@@ -894,12 +944,13 @@ mod compiler {
         use crate::compiler::PartiallyCompiledExpression as PCE;
         match expr {
             PCE::Boolean(_) => Type::Primitive(Primitive::Bool),
-            PCE::Input(_) => Type::Primitive(Primitive::Bool),
             PCE::Select(_, _, _) => Type::Primitive(Primitive::Bool),
+            PCE::Input(_) => Type::Primitive(Primitive::Bool),
             PCE::Number(_) => Type::Primitive(Primitive::Numeral),
             PCE::Type(_) => Type::Primitive(Primitive::Type),
             PCE::Circular(ty, _) => ty.clone(),
             PCE::Wrap(id, _) => Type::Typedef(*id),
+            PCE::Label(_, expr) => find_type(expr),
             PCE::Tuple(exprs) => Type::Tuple(exprs.iter().map(find_type).collect()),
             PCE::Component(args, ret, _) => Type::Function(
                 args.iter().map(|x| x.1.clone()).collect(),
@@ -918,6 +969,7 @@ mod compiler {
                     .map(evaluate_type)
                     .collect::<Result<_, _>>()?,
             ),
+            PCE::Label(_, expr) => evaluate_type(*expr)?,
             expr => {
                 return Err(TypeError::MismatchedTypes(
                     Type::Primitive(Primitive::Type),
@@ -930,17 +982,27 @@ mod compiler {
     fn reduce_expr(
         expr: Expression,
         context: &Context,
-        nesting: usize,
+        label: Option<usize>,
         typedefs: &mut Vec<Type>,
     ) -> Result<PartiallyCompiledExpression, TypeError> {
         use crate::compiler::PartiallyCompiledExpression as PCE;
         use crate::parser::Expression as E;
         Ok(match expr {
-            E::Wrap(id, expr) => PCE::Wrap(
-                id,
-                Box::new(reduce_expr(*expr, context, nesting, typedefs)?),
-            ),
-            E::Unwrap(expr) => match reduce_expr(*expr, context, nesting, typedefs)? {
+            E::Map(name, expr, body) => match reduce_expr(*expr, context, label, typedefs)? {
+                PCE::Tuple(exprs) => exprs
+                    .into_iter()
+                    .map(|x| {
+                        let mut context = context.clone();
+                        add_to_context(name.clone(), x, &mut context);
+                        reduce_expr((*body).clone(), &context, label, typedefs)
+                    })
+                    .collect::<Result<_, _>>()?,
+                expr => return Err(TypeError::CannotIndex(find_type(&expr))),
+            },
+            E::Wrap(id, expr) => {
+                PCE::Wrap(id, Box::new(reduce_expr(*expr, context, label, typedefs)?))
+            }
+            E::Unwrap(expr) => match reduce_expr(*expr, context, label, typedefs)? {
                 PCE::Wrap(_, expr) => *expr,
                 expr => {
                     return Err(TypeError::Custom(format!(
@@ -961,8 +1023,7 @@ mod compiler {
                 .ok_or(TypeError::UndefinedIdentifier(name))?
                 .clone(),
             E::TypedVarAccess(name, ty) => {
-                let ty =
-                    reduce_expr(*ty, context, nesting + 1, typedefs).and_then(evaluate_type)?;
+                let ty = reduce_expr(*ty, context, None, typedefs).and_then(evaluate_type)?;
                 let exprs = context
                     .get(&name)
                     .ok_or(TypeError::UndefinedIdentifier(name.clone()))?;
@@ -977,39 +1038,42 @@ mod compiler {
                     .ok_or(TypeError::MismatchedTypes(ty, potential_ty))?
                     .clone()
             }
-            E::Select(a, b, c) => match reduce_expr(*a, context, nesting + 1, typedefs)? {
+            E::Select(a, b, c) => match reduce_expr(*a, context, label, typedefs)? {
                 PCE::Boolean(val) => {
                     if val {
-                        reduce_expr(*b, context, nesting, typedefs)?
+                        reduce_expr(*b, context, label, typedefs)?
                     } else {
-                        reduce_expr(*c, context, nesting, typedefs)?
+                        reduce_expr(*c, context, label, typedefs)?
                     }
                 }
                 a => {
-                    let b = reduce_expr(*b, context, nesting + 1, typedefs)?;
-                    let c = reduce_expr(*c, context, nesting + 1, typedefs)?;
-                    PCE::Select(Box::new(a), Box::new(b), Box::new(c))
+                    let b = reduce_expr(*b, context, label, typedefs)?;
+                    let c = reduce_expr(*c, context, label, typedefs)?;
+                    if b == c {
+                        b
+                    } else {
+                        PCE::Select(Box::new(a), Box::new(b), Box::new(c))
+                    }
                 }
             },
             E::Typedef(ty) => {
-                let ty =
-                    reduce_expr(*ty, context, nesting + 1, typedefs).and_then(evaluate_type)?;
+                let ty = reduce_expr(*ty, context, None, typedefs).and_then(evaluate_type)?;
                 typedefs.push(ty);
                 PCE::Type(Type::Typedef(typedefs.len() - 1))
             }
             E::CompType(args, ret) => PCE::Type(Type::Function(
                 args.into_iter()
-                    .map(|x| reduce_expr(x, context, nesting + 1, typedefs).and_then(evaluate_type))
+                    .map(|x| reduce_expr(x, context, None, typedefs).and_then(evaluate_type))
                     .collect::<Result<_, _>>()?,
-                reduce_expr(*ret, context, nesting + 1, typedefs)
+                reduce_expr(*ret, context, None, typedefs)
                     .and_then(evaluate_type)
                     .map(Box::new)?,
             )),
             E::Tuple(exprs) => exprs
                 .into_iter()
-                .map(|x| reduce_expr(x, context, nesting + 1, typedefs))
+                .map(|x| reduce_expr(x, context, label, typedefs))
                 .collect::<Result<_, _>>()?,
-            E::Index(expr, index) => match reduce_expr(*expr, context, nesting + 1, typedefs)? {
+            E::Index(expr, index) => match reduce_expr(*expr, context, label, typedefs)? {
                 PCE::Tuple(mut exprs) => match index {
                     Index::Number(index) => {
                         if index >= exprs.len() {
@@ -1023,7 +1087,7 @@ mod compiler {
                 expr => return Err(TypeError::CannotIndex(find_type(&expr))),
             },
             E::Block(rules, expr) => reduce_block(rules, *expr, context, typedefs)?,
-            E::Call(func, args) => reduce_call(*func, args, context, nesting, typedefs)?,
+            E::Call(func, args) => reduce_call(*func, args, context, label, typedefs)?,
             E::Component(args, generics, ret, expr) => {
                 let mut context = context.clone();
                 context.extend(
@@ -1034,12 +1098,12 @@ mod compiler {
                 PCE::Component(
                     args.into_iter()
                         .map(|(n, x)| {
-                            reduce_expr(x, &context, nesting + 1, typedefs)
+                            reduce_expr(x, &context, None, typedefs)
                                 .and_then(evaluate_type)
                                 .map(|x| (n, x))
                         })
                         .collect::<Result<_, _>>()?,
-                    reduce_expr(*ret, &context, nesting + 1, typedefs).and_then(evaluate_type)?,
+                    reduce_expr(*ret, &context, None, typedefs).and_then(evaluate_type)?,
                     expr,
                 )
             }
@@ -1055,8 +1119,10 @@ mod compiler {
                 })
                 .collect(),
             E::Circular(ty) => PCE::Circular(
-                reduce_expr(*ty, context, nesting + 1, typedefs).and_then(evaluate_type)?,
-                nesting,
+                reduce_expr(*ty, context, None, typedefs).and_then(evaluate_type)?,
+                label.ok_or(TypeError::Custom(
+                    "Cannot use circular expression outside of a rule or in a type".into(),
+                ))?,
             ),
         })
     }
@@ -1065,11 +1131,11 @@ mod compiler {
         func: Expression,
         args: Vec<Expression>,
         context: &Context,
-        nesting: usize,
+        label: Option<usize>,
         typedefs: &mut Vec<Type>,
     ) -> Result<PartiallyCompiledExpression, TypeError> {
         let ((arg_names, mut arg_types), ret, expr): ((Vec<_>, Vec<_>), _, _) =
-            match reduce_expr(func, context, nesting + 1, typedefs)? {
+            match reduce_expr(func, context, label, typedefs)? {
                 PartiallyCompiledExpression::Component(a, b, c) => (a.into_iter().unzip(), b, *c),
                 PartiallyCompiledExpression::Type(Type::Typedef(id)) => (
                     (vec!["*a".into()], vec![typedefs[id].clone()]),
@@ -1085,7 +1151,7 @@ mod compiler {
         }
         let args = args
             .into_iter()
-            .map(|x| reduce_expr(x, context, nesting + 1, typedefs))
+            .map(|x| reduce_expr(x, context, label, typedefs))
             .collect::<Result<Vec<_>, _>>()?;
         if args.len() > arg_types.len() {
             return Err(TypeError::ExtraArgument(find_type(&args[arg_types.len()])));
@@ -1108,7 +1174,7 @@ mod compiler {
         resolved.into_iter().for_each(|(n, t)| {
             add_to_context(n, PartiallyCompiledExpression::Type(t), &mut context)
         });
-        let expr = reduce_expr(expr, &context, nesting + 1, typedefs)?;
+        let expr = reduce_expr(expr, &context, None, typedefs)?;
         let ret_actual = find_type(&expr);
         if ret != ret_actual {
             return Err(TypeError::MismatchedTypes(ret, ret_actual));
@@ -1124,7 +1190,7 @@ mod compiler {
     ) -> Result<PartiallyCompiledExpression, TypeError> {
         let mut context = context.clone();
         reduce_rules(rules, &mut context, typedefs)?;
-        reduce_expr(expr, &context, 0, typedefs)
+        reduce_expr(expr, &context, None, typedefs)
     }
 
     fn reduce_rules(
@@ -1133,11 +1199,19 @@ mod compiler {
         typedefs: &mut Vec<Type>,
     ) -> Result<(), TypeError> {
         rules.into_iter().try_for_each(|x| {
-            let expr = reduce_expr(x.2, &*context, 0, typedefs)?;
+            let expr = if x.2 {
+                let label = LABELS.fetch_add(1, Ordering::Relaxed);
+                PartiallyCompiledExpression::Label(
+                    label,
+                    Box::new(reduce_expr(x.3, &*context, Some(label), typedefs)?),
+                )
+            } else {
+                reduce_expr(x.3, &*context, None, typedefs)?
+            };
             let expr_type = find_type(&expr);
             let mut reqs =
                 x.1.into_iter()
-                    .map(|x| reduce_expr(x, &*context, 0, typedefs).and_then(evaluate_type));
+                    .map(|x| reduce_expr(x, &*context, None, typedefs).and_then(evaluate_type));
             if let Some(t) = reqs.find(|x| x.as_ref().map_or(true, |x| x != &expr_type)) {
                 t.and_then(|x| Err(TypeError::MismatchedTypes(x, expr_type)))?;
             }
@@ -1146,13 +1220,26 @@ mod compiler {
         })
     }
 
-    fn reduce(rules: Vec<Rule>, inputs: Vec<Rc<str>>) -> Result<Context, TypeError> {
+    fn structure_to_pce(structure: Structure, id: &mut usize) -> PartiallyCompiledExpression {
+        match structure {
+            Structure::Value => {
+                let expr = PartiallyCompiledExpression::Input(*id);
+                *id += 1;
+                expr
+            }
+            Structure::Tuple(structures) => structures
+                .into_iter()
+                .map(|x| structure_to_pce(x, id))
+                .collect(),
+        }
+    }
+
+    fn reduce(rules: Vec<Rule>, inputs: Vec<(Rc<str>, Structure)>) -> Result<Context, TypeError> {
         use crate::compiler::PartiallyCompiledExpression as PCE;
         let mut context = HashMap::with_capacity(inputs.len() + 5);
         inputs
             .into_iter()
-            .enumerate()
-            .for_each(|(i, x)| add_to_context(x, PCE::Input(i), &mut context));
+            .for_each(|(n, s)| add_to_context(n, structure_to_pce(s, &mut 0), &mut context));
         add_to_context("false".into(), PCE::Boolean(false), &mut context);
         add_to_context("true".into(), PCE::Boolean(true), &mut context);
         add_to_context(
@@ -1192,6 +1279,7 @@ mod compiler {
         Boolean(bool),
         Input(usize),
         Circular(usize),
+        Label(usize, Box<Value>),
         Select(Box<Value>, Box<Value>, Box<Value>),
     }
 
@@ -1200,63 +1288,69 @@ mod compiler {
         use crate::compiler::Value as V;
         Ok(match expr {
             PCE::Boolean(val) => V::Boolean(val),
-            PCE::Input(val) => V::Input(val),
-            PCE::Circular(Type::Primitive(Primitive::Bool), nesting) => V::Circular(nesting),
+            PCE::Input(id) => V::Input(id),
+            PCE::Circular(Type::Primitive(Primitive::Bool), id) => V::Circular(id),
+            PCE::Label(id, expr) => V::Label(id, Box::new(resolve_expr(*expr)?)),
             PCE::Select(a, b, c) => V::Select(
                 Box::new(resolve_expr(*a)?),
                 Box::new(resolve_expr(*b)?),
                 Box::new(resolve_expr(*c)?),
             ),
-            expr @ PCE::Number(_) => {
-                return Err(TypeError::MismatchedTypes(
-                    Type::Primitive(Primitive::Bool),
-                    find_type(&expr),
-                ))
-            }
             expr => todo!("{expr:#?}"),
         })
     }
 
+    fn resolve_expr_structural(
+        expr: PartiallyCompiledExpression,
+        structure: Structure,
+    ) -> Result<Vec<Value>, TypeError> {
+        match structure {
+            Structure::Value => resolve_expr(expr).map(|x| vec![x]),
+            Structure::Tuple(structures) => match expr {
+                PartiallyCompiledExpression::Tuple(exprs) => {
+                    let mut result = vec![];
+                    for (expr, structure) in exprs.into_iter().zip(structures) {
+                        result.append(&mut resolve_expr_structural(expr, structure)?)
+                    }
+                    Ok(result)
+                }
+                expr => todo!("{expr:#?}"),
+            },
+        }
+    }
+
     fn resolve(
         mut context: Context,
-        outputs: Vec<(Rc<str>, Type)>,
+        outputs: Vec<(Rc<str>, Structure)>,
     ) -> Result<Vec<Value>, TypeError> {
-        outputs
-            .into_iter()
-            .map(|(x, t)| {
-                let exprs = context
-                    .remove(&x)
-                    .ok_or(TypeError::UndefinedIdentifier(x.clone()))?;
-                let potential_ty = exprs
-                    .last()
-                    .map(find_type)
-                    .ok_or(TypeError::UndefinedIdentifier(x))?;
-                match exprs.into_iter().filter(|x| find_type(x) == t).last() {
-                    Some(expr) => resolve_expr(expr),
-                    None => Err(TypeError::MismatchedTypes(t, potential_ty)),
-                }
-            })
-            .collect()
+        let mut result = vec![];
+        for (x, s) in outputs {
+            let exprs = context
+                .remove(&x)
+                .ok_or(TypeError::UndefinedIdentifier(x.clone()))?;
+            let potential_ty = exprs
+                .last()
+                .map(find_type)
+                .ok_or(TypeError::UndefinedIdentifier(x))?;
+            let t = find_type(&structure_to_pce(s.clone(), &mut 0));
+            match exprs.into_iter().filter(|x| find_type(x) == t).last() {
+                Some(expr) => result.append(&mut resolve_expr_structural(expr, s)?),
+                None => return Err(TypeError::MismatchedTypes(t, potential_ty)),
+            };
+        }
+        Ok(result)
     }
 
     pub fn compile((inputs, outputs, statements): ParseResult) -> Result<Vec<Value>, TypeError> {
-        resolve(
-            reduce(statements, inputs)?,
-            outputs
-                .into_iter()
-                .zip(std::iter::repeat(Type::Primitive(Primitive::Bool)))
-                .collect(),
-        )
+        resolve(reduce(statements, inputs)?, outputs)
     }
 }
 
 fn main() {
     let string = "
-    INPUT;
-    OUTPUT o;
-    newtype ty bool;
-    unwrap = |arg| arg!;
-    o = unwrap(ty(false));
+    INPUT i[200];
+    OUTPUT o[200];
+    o = map i: i select(i, false, true);
     ";
     match full_parse(string).map(compile) {
         Ok(Ok(rules)) => println!("{rules:#?}"),
