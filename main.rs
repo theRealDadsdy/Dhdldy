@@ -45,6 +45,7 @@ mod tokenizer {
         ClosingBracket,
         OpeningAngle,
         ClosingAngle,
+        Spread,
         Bar,
         Comma,
         Semicolon,
@@ -89,6 +90,7 @@ mod tokenizer {
                 Token::ClosingBracket => write!(formatter, "]"),
                 Token::OpeningAngle => write!(formatter, "<"),
                 Token::ClosingAngle => write!(formatter, ">"),
+                Token::Spread => write!(formatter, ".."),
                 Token::Bar => write!(formatter, "|"),
                 Token::Comma => write!(formatter, ","),
                 Token::Colon => write!(formatter, ":"),
@@ -177,6 +179,11 @@ mod tokenizer {
                     '-' => match self.0.next() {
                         Some('>') => Token::Arrow,
                         Some(_) => Err(TokenError::InvalidChar('-'))?,
+                        None => Err(TokenError::EoF)?,
+                    },
+                    '.' => match self.0.next() {
+                        Some('.') => Token::Spread,
+                        Some(_) => Err(TokenError::InvalidChar('.'))?,
                         None => Err(TokenError::EoF)?,
                     },
                     '\'' => Token::Char(self.0.next().ok_or(TokenError::EoF)?),
@@ -272,12 +279,25 @@ mod parser {
     }
 
     #[derive(Debug, Clone, PartialEq)]
+    pub enum Statement {
+        Rule(Rule),
+        Foreach(Foreach),
+        If(If),
+    }
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct If(pub Expression, pub Vec<Statement>);
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Foreach(pub Rc<str>, pub Expression, pub Vec<Statement>);
+    #[derive(Debug, Clone, PartialEq)]
     pub struct Rule(pub Rc<str>, pub Vec<Expression>, pub bool, pub Expression);
     #[derive(Debug, Clone, PartialEq)]
     pub enum Expression {
         String(String),
         Error(String),
         Select(Box<Expression>, Box<Expression>, Box<Expression>),
+        Inc(Box<Expression>),
+        Dec(Box<Expression>),
+        IsZero(Box<Expression>),
         Map(Rc<str>, Box<Expression>, Box<Expression>),
         VarAccess(Rc<str>),
         TypedVarAccess(Rc<str>, Box<Expression>),
@@ -285,12 +305,13 @@ mod parser {
         Typedef(Box<Expression>),
         Wrap(usize, Box<Expression>),
         Unwrap(Box<Expression>),
-        Tuple(Vec<Expression>),
+        Tuple(Vec<Item<Expression>>),
+        Array(Box<Expression>, Box<Expression>),
         Index(Box<Expression>, Index),
-        Call(Box<Expression>, Vec<Expression>),
-        Block(Vec<Rule>, Box<Expression>),
+        Call(Box<Expression>, Vec<Item<Expression>>),
+        Block(Vec<Statement>, Box<Expression>),
         Component(
-            Vec<(Rc<str>, Expression)>,
+            Vec<Item<(Rc<str>, Expression)>>,
             Vec<Rc<str>>,
             Box<Expression>,
             Box<Expression>,
@@ -299,11 +320,23 @@ mod parser {
         Number(u128, Option<u32>),
     }
     #[derive(Debug, Clone, PartialEq)]
-    pub enum Index {
-        Number(usize),
-        Range(usize, usize),
+    pub enum Item<T> {
+        Value(T),
+        Spread(T),
     }
-
+    impl<T> Item<T> {
+        pub fn unwrap(self) -> T {
+            match self {
+                Item::Value(val) => val,
+                Item::Spread(val) => val,
+            }
+        }
+    }
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Index {
+        Number(Box<Expression>),
+        Range(Box<Expression>, Box<Expression>),
+    }
     pub enum ParseError {
         TokenError(TokenError),
         UnexpectedToken(Token, Vec<&'static str>, u32),
@@ -335,20 +368,50 @@ mod parser {
         }
     }
 
-    fn try_parse_statement(tokens: &mut TokenStream) -> Option<Result<Rule, ParseError>> {
+    fn try_parse_statement(tokens: &mut TokenStream) -> Option<Result<Statement, ParseError>> {
         match (tokens.peek(), tokens.peek2()) {
             (Ok(Token::Keyword(Keyword::Error)), _) => Some({
                 (|| {
                     let error = parse_expression(tokens)?;
                     assert_token!(tokens, Token::Semicolon);
-                    Ok(Rule("*".into(), vec![], false, error))
+                    Ok(Statement::Rule(Rule("*".into(), vec![], false, error)))
                 })()
             }),
-            (Ok(Token::Keyword(Keyword::TypeDef)), _) => Some(parse_typedef(tokens)),
-            (Ok(Token::Ident(_)), Ok(Token::Colon | Token::Equals)) => Some(parse_rule(tokens)),
-            (Ok(Token::Keyword(Keyword::FuncDef)), _) => Some(parse_func_def(tokens)),
+            (Ok(Token::Keyword(Keyword::TypeDef)), _) => {
+                Some(parse_typedef(tokens).map(Statement::Rule))
+            }
+            (Ok(Token::Ident(_)), Ok(Token::Colon | Token::Equals)) => {
+                Some(parse_rule(tokens).map(Statement::Rule))
+            }
+            (Ok(Token::Keyword(Keyword::FuncDef)), _) => {
+                Some(parse_func_def(tokens).map(Statement::Rule))
+            }
+            (Ok(Token::Keyword(Keyword::Foreach)), _) => {
+                Some(parse_foreach(tokens).map(Statement::Foreach))
+            }
+            (Ok(Token::Keyword(Keyword::If)), _) => Some(parse_if(tokens).map(Statement::If)),
             _ => None,
         }
+    }
+
+    fn parse_if(tokens: &mut TokenStream) -> Result<If, ParseError> {
+        assert_token!(tokens, Token::Keyword(Keyword::If));
+        let expr = parse_expression(tokens)?;
+        assert_token!(tokens, Token::OpeningBrace);
+        let rules = parse_statements(tokens)?;
+        assert_token!(tokens, Token::ClosingBrace);
+        Ok(If(expr, rules))
+    }
+
+    fn parse_foreach(tokens: &mut TokenStream) -> Result<Foreach, ParseError> {
+        assert_token!(tokens, Token::Keyword(Keyword::Foreach));
+        let name = match_token!(tokens, Token::Ident(name) => name);
+        assert_token!(tokens, Token::Colon);
+        let expr = parse_expression(tokens)?;
+        assert_token!(tokens, Token::OpeningBrace);
+        let rules = parse_statements(tokens)?;
+        assert_token!(tokens, Token::ClosingBrace);
+        Ok(Foreach(name, expr, rules))
     }
 
     fn parse_typedef(tokens: &mut TokenStream) -> Result<Rule, ParseError> {
@@ -383,7 +446,7 @@ mod parser {
                 Token::ClosingParen => break,
                 Token::Ident(name) => {
                     assert_token!(tokens, Token::Colon);
-                    args.push((name, parse_expression(tokens)?));
+                    args.push(Item::Value((name, parse_expression(tokens)?)));
                 }
             )
         }
@@ -422,10 +485,10 @@ mod parser {
         while let Some(expr) = subs.pop() {
             use crate::parser::Expression as E;
             match expr {
-                E::Tuple(mut exprs) => subs.append(&mut exprs),
-                E::Call(expr, mut exprs) => {
+                E::Tuple(exprs) => subs.extend(exprs.into_iter().map(Item::unwrap)),
+                E::Call(expr, exprs) => {
                     subs.push(*expr);
-                    subs.append(&mut exprs);
+                    subs.extend(exprs.into_iter().map(Item::unwrap));
                 }
                 E::Circular(ty) => {
                     reqs.push(*ty);
@@ -434,7 +497,11 @@ mod parser {
                 E::Index(expr, _) => subs.push(*expr),
                 E::Unwrap(expr) => subs.push(*expr),
                 E::TypedVarAccess(_, expr) => subs.push(*expr),
-                E::Select(expr1, expr2, expr3) => subs.extend([*expr1, *expr2, *expr3]),
+                E::Select(expr1, expr2, expr3) => {
+                    subs.push(*expr1);
+                    subs.push(*expr2);
+                    subs.push(*expr3);
+                }
                 E::Typedef(expr) => subs.push(*expr),
                 E::Wrap(_, expr) => subs.push(*expr),
                 E::CompType(mut args, expr) => {
@@ -442,7 +509,7 @@ mod parser {
                     subs.push(*expr);
                 }
                 E::Component(args, _, ret, expr) => {
-                    subs.extend(args.into_iter().map(|x| x.1));
+                    subs.extend(args.into_iter().map(|x| x.unwrap().1));
                     subs.push(*ret);
                     subs.push(*expr);
                 }
@@ -450,6 +517,13 @@ mod parser {
                     subs.push(*expr);
                     subs.push(*body);
                 }
+                E::Array(expr, reps) => {
+                    subs.push(*expr);
+                    subs.push(*reps);
+                }
+                E::Inc(expr) => subs.push(*expr),
+                E::Dec(expr) => subs.push(*expr),
+                E::IsZero(expr) => subs.push(*expr),
                 E::Error(_) | E::Number(..) | E::String(_) | E::VarAccess(_) | E::Block(..) => (),
             }
         }
@@ -531,6 +605,16 @@ mod parser {
         }
     }
 
+    fn parse_item(tokens: &mut TokenStream) -> Result<Item<Expression>, ParseError> {
+        match tokens.peek() {
+            Ok(Token::Spread) => {
+                let _ = tokens.token();
+                parse_expression(tokens).map(Item::Spread)
+            }
+            _ => parse_expression(tokens).map(Item::Value),
+        }
+    }
+
     fn parse_map(tokens: &mut TokenStream) -> Result<Expression, ParseError> {
         let name = match_token!(tokens, Token::Ident(name) => name);
         assert_token!(tokens, Token::Colon);
@@ -548,16 +632,18 @@ mod parser {
                     return Ok(Expression::Tuple(exprs));
                 }
                 _ => {
-                    exprs.push(parse_expression(tokens)?);
+                    let expr = parse_item(tokens)?;
                     match_token!(tokens,
-                        Token::Comma => {},
+                        Token::Comma => exprs.push(expr),
                         Token::Semicolon => {
-                            let reps = match_token!(tokens, Token::Numeral(num) => num);
-                            let expr = exprs.pop().expect("I just added it, grr");
+                            let reps = parse_expression(tokens)?;
                             assert_token!(tokens, Token::ClosingBracket);
-                            return Ok(Expression::Tuple(vec![expr; reps as usize]));
+                            return Ok(Expression::Array(Box::new(expr.unwrap()), Box::new(reps)));
                         },
-                        Token::ClosingBracket => return Ok(Expression::Tuple(exprs)),
+                        Token::ClosingBracket => {
+                            exprs.push(expr);
+                            return Ok(Expression::Tuple(exprs));
+                        }
                     )
                 }
             }
@@ -571,7 +657,7 @@ mod parser {
             _ => {
                 let expr = parse_expression(tokens)?;
                 match_token!(tokens,
-                    Token::Comma => exprs.push(expr),
+                    Token::Comma => exprs.push(Item::Value(expr)),
                     Token::ClosingParen => return Ok(expr),
                 )
             }
@@ -583,7 +669,7 @@ mod parser {
                     return Ok(Expression::Tuple(exprs));
                 }
                 _ => {
-                    exprs.push(parse_expression(tokens)?);
+                    exprs.push(Item::Value(parse_expression(tokens)?));
                     match_token!(tokens,
                         Token::Comma => (),
                         Token::ClosingParen => return Ok(Expression::Tuple(exprs)),
@@ -603,7 +689,7 @@ mod parser {
                     return Ok(Expression::Call(Box::new(func), exprs));
                 }
                 _ => {
-                    exprs.push(parse_expression(tokens)?);
+                    exprs.push(Item::Value(parse_expression(tokens)?));
                     match_token!(tokens,
                         Token::Comma => (),
                         Token::ClosingParen => return Ok(Expression::Call(Box::new(func), exprs)),
@@ -618,17 +704,13 @@ mod parser {
         tokens: &mut TokenStream,
     ) -> Result<Expression, ParseError> {
         assert_token!(tokens, Token::OpeningBracket);
-        let num1 = match_token!(tokens,
-            Token::Numeral(num) => num as usize,
-        );
+        let num1 = parse_expression(tokens)?;
         let index = match_token!(tokens,
-            Token::ClosingBracket => Index::Number(num1),
+            Token::ClosingBracket => Index::Number(Box::new(num1)),
             Token::Colon => {
-                let num2 = match_token!(tokens,
-                    Token::Numeral(num) => num as usize,
-                );
+                let num2 = parse_expression(tokens)?;
                 assert_token!(tokens, Token::ClosingBracket);
-                Index::Range(num1, num2)
+                Index::Range(Box::new(num1), Box::new(num2))
             },
         );
         Ok(Expression::Index(Box::new(expr), index))
@@ -656,6 +738,7 @@ mod parser {
         Ok(Expression::Component(
             args.into_iter()
                 .map(|x| (x, Expression::VarAccess("any".into())))
+                .map(Item::Value)
                 .collect(),
             vec![],
             Box::new(Expression::VarAccess("any".into())),
@@ -663,7 +746,7 @@ mod parser {
         ))
     }
 
-    fn parse_statements(tokens: &mut TokenStream) -> Result<Vec<Rule>, ParseError> {
+    fn parse_statements(tokens: &mut TokenStream) -> Result<Vec<Statement>, ParseError> {
         iter::from_fn(|| try_parse_statement(tokens)).collect()
     }
 
@@ -676,7 +759,7 @@ mod parser {
     pub type ParseResult = (
         Vec<(Rc<str>, Structure)>,
         Vec<(Rc<str>, Structure)>,
-        Vec<Rule>,
+        Vec<Statement>,
     );
 
     pub fn full_parse(string: &str) -> Result<ParseResult, ParseError> {
@@ -879,6 +962,7 @@ mod compiler {
         MissingArgument(Type),
         ExtraArgument(Type),
     }
+
     impl std::fmt::Display for TypeError {
         fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self{
@@ -924,6 +1008,29 @@ mod compiler {
             T: IntoIterator<Item = PartiallyCompiledExpression>,
         {
             PartiallyCompiledExpression::Tuple(iter.into_iter().collect())
+        }
+    }
+
+    impl<I> FromIterator<I> for PartiallyCompiledExpression
+    where
+        I: IntoIterator<Item = PartiallyCompiledExpression>,
+    {
+        fn from_iter<T>(iter: T) -> PartiallyCompiledExpression
+        where
+            T: IntoIterator<Item = I>,
+        {
+            PartiallyCompiledExpression::Tuple(iter.into_iter().flatten().collect())
+        }
+    }
+
+    impl PartiallyCompiledExpression {
+        fn try_into_iter(
+            self,
+        ) -> Result<std::vec::IntoIter<PartiallyCompiledExpression>, TypeError> {
+            match self {
+                PartiallyCompiledExpression::Tuple(exprs) => Ok(exprs.into_iter()),
+                _ => Err(TypeError::CannotIndex(find_type(&self))),
+            }
         }
     }
 
@@ -979,6 +1086,21 @@ mod compiler {
         })
     }
 
+    fn reduce_item(
+        item: Item<Expression>,
+        context: &Context,
+        label: Option<usize>,
+        typedefs: &mut Vec<Type>,
+    ) -> Result<Vec<PartiallyCompiledExpression>, TypeError> {
+        Ok(match item {
+            Item::Value(expr) => vec![reduce_expr(expr, context, label, typedefs)?],
+            Item::Spread(expr) => match reduce_expr(expr, context, label, typedefs)? {
+                PartiallyCompiledExpression::Tuple(exprs) => exprs,
+                expr => return Err(TypeError::CannotIndex(find_type(&expr))),
+            },
+        })
+    }
+
     fn reduce_expr(
         expr: Expression,
         context: &Context,
@@ -988,17 +1110,34 @@ mod compiler {
         use crate::compiler::PartiallyCompiledExpression as PCE;
         use crate::parser::Expression as E;
         Ok(match expr {
-            E::Map(name, expr, body) => match reduce_expr(*expr, context, label, typedefs)? {
-                PCE::Tuple(exprs) => exprs
-                    .into_iter()
-                    .map(|x| {
-                        let mut context = context.clone();
-                        add_to_context(name.clone(), x, &mut context);
-                        reduce_expr((*body).clone(), &context, label, typedefs)
-                    })
-                    .collect::<Result<_, _>>()?,
-                expr => return Err(TypeError::CannotIndex(find_type(&expr))),
+            E::IsZero(expr) => match reduce_expr(*expr, context, label, typedefs)? {
+                PCE::Number(num) => PCE::Boolean(num == 0),
+                _ => todo!(),
             },
+            E::Inc(expr) => match reduce_expr(*expr, context, label, typedefs)? {
+                PCE::Number(num) => PCE::Number(num + 1),
+                _ => todo!(),
+            },
+            E::Dec(expr) => match reduce_expr(*expr, context, label, typedefs)? {
+                PCE::Number(0) => return Err(TypeError::Custom("Cannot decrement 0".into())),
+                PCE::Number(num) => PCE::Number(num - 1),
+                _ => todo!(),
+            },
+            E::Array(expr, reps) => match reduce_expr(*reps, context, label, typedefs)? {
+                PCE::Number(reps) => PCE::Tuple(vec![
+                    reduce_expr(*expr, context, label, typedefs)?;
+                    reps as usize
+                ]),
+                _ => todo!(),
+            },
+            E::Map(name, expr, body) => reduce_expr(*expr, context, label, typedefs)?
+                .try_into_iter()?
+                .map(|x| {
+                    let mut context = context.clone();
+                    add_to_context(name.clone(), x, &mut context);
+                    reduce_expr((*body).clone(), &context, label, typedefs)
+                })
+                .collect::<Result<_, _>>()?,
             E::Wrap(id, expr) => {
                 PCE::Wrap(id, Box::new(reduce_expr(*expr, context, label, typedefs)?))
             }
@@ -1071,16 +1210,22 @@ mod compiler {
             )),
             E::Tuple(exprs) => exprs
                 .into_iter()
-                .map(|x| reduce_expr(x, context, label, typedefs))
+                .map(|x| reduce_item(x, context, label, typedefs))
                 .collect::<Result<_, _>>()?,
             E::Index(expr, index) => match reduce_expr(*expr, context, label, typedefs)? {
                 PCE::Tuple(mut exprs) => match index {
-                    Index::Number(index) => {
-                        if index >= exprs.len() {
-                            return Err(TypeError::OutOfBoundsIndexing(exprs.len(), index));
+                    Index::Number(index) => match reduce_expr(*index, context, label, typedefs)? {
+                        PCE::Number(index) => {
+                            if index as usize >= exprs.len() {
+                                return Err(TypeError::OutOfBoundsIndexing(
+                                    exprs.len(),
+                                    index as usize,
+                                ));
+                            }
+                            exprs.swap_remove(index as usize)
                         }
-                        exprs.swap_remove(index)
-                    }
+                        _ => todo!(),
+                    },
                     Index::Range(_start, _end) => todo!(),
                 },
                 // expr => todo!("{expr:?}"),
@@ -1097,6 +1242,7 @@ mod compiler {
                 );
                 PCE::Component(
                     args.into_iter()
+                        .map(Item::unwrap)
                         .map(|(n, x)| {
                             reduce_expr(x, &context, None, typedefs)
                                 .and_then(evaluate_type)
@@ -1111,12 +1257,9 @@ mod compiler {
                 return Err(TypeError::Custom(format!("Error with \"{message}\"")))
             }
             E::String(string) => string
-                .chars()
-                .map(|x| {
-                    (0..8)
-                        .map(|i| PCE::Boolean((x as u8 >> i) & 1 != 0))
-                        .collect()
-                })
+                .as_bytes()
+                .iter()
+                .map(|x| (0..8).map(move |i| PCE::Boolean((*x >> i) & 1 != 0)))
                 .collect(),
             E::Circular(ty) => PCE::Circular(
                 reduce_expr(*ty, context, None, typedefs).and_then(evaluate_type)?,
@@ -1129,7 +1272,7 @@ mod compiler {
 
     fn reduce_call(
         func: Expression,
-        args: Vec<Expression>,
+        args: Vec<Item<Expression>>,
         context: &Context,
         label: Option<usize>,
         typedefs: &mut Vec<Type>,
@@ -1149,10 +1292,13 @@ mod compiler {
                 arg_types.swap_remove(args.len()),
             ));
         }
-        let args = args
-            .into_iter()
-            .map(|x| reduce_expr(x, context, label, typedefs))
-            .collect::<Result<Vec<_>, _>>()?;
+        let args = {
+            let mut result = vec![];
+            args.into_iter().try_for_each(|x| {
+                reduce_item(x, context, label, typedefs).map(|mut x| result.append(&mut x))
+            })?;
+            result
+        };
         if args.len() > arg_types.len() {
             return Err(TypeError::ExtraArgument(find_type(&args[arg_types.len()])));
         }
@@ -1183,7 +1329,7 @@ mod compiler {
     }
 
     fn reduce_block(
-        rules: Vec<Rule>,
+        rules: Vec<Statement>,
         expr: Expression,
         context: &Context,
         typedefs: &mut Vec<Type>,
@@ -1193,30 +1339,54 @@ mod compiler {
         reduce_expr(expr, &context, None, typedefs)
     }
 
-    fn reduce_rules(
-        rules: Vec<Rule>,
+    fn reduce_rule(
+        rule: Rule,
         context: &mut Context,
         typedefs: &mut Vec<Type>,
     ) -> Result<(), TypeError> {
-        rules.into_iter().try_for_each(|x| {
-            let expr = if x.2 {
-                let label = LABELS.fetch_add(1, Ordering::Relaxed);
-                PartiallyCompiledExpression::Label(
-                    label,
-                    Box::new(reduce_expr(x.3, &*context, Some(label), typedefs)?),
-                )
-            } else {
-                reduce_expr(x.3, &*context, None, typedefs)?
-            };
-            let expr_type = find_type(&expr);
-            let mut reqs =
-                x.1.into_iter()
-                    .map(|x| reduce_expr(x, &*context, None, typedefs).and_then(evaluate_type));
-            if let Some(t) = reqs.find(|x| x.as_ref().map_or(true, |x| x != &expr_type)) {
-                t.and_then(|x| Err(TypeError::MismatchedTypes(x, expr_type)))?;
+        let expr = if rule.2 {
+            let label = LABELS.fetch_add(1, Ordering::Relaxed);
+            PartiallyCompiledExpression::Label(
+                label,
+                Box::new(reduce_expr(rule.3, &*context, Some(label), typedefs)?),
+            )
+        } else {
+            reduce_expr(rule.3, &*context, None, typedefs)?
+        };
+        let expr_type = find_type(&expr);
+        let mut reqs = rule
+            .1
+            .into_iter()
+            .map(|x| reduce_expr(x, &*context, None, typedefs).and_then(evaluate_type));
+        if let Some(t) = reqs.find(|x| x.as_ref().map_or(true, |x| x != &expr_type)) {
+            t.and_then(|x| Err(TypeError::MismatchedTypes(x, expr_type)))?;
+        }
+        add_to_context(rule.0, expr, context);
+        Ok(())
+    }
+
+    fn reduce_rules(
+        rules: Vec<Statement>,
+        context: &mut Context,
+        typedefs: &mut Vec<Type>,
+    ) -> Result<(), TypeError> {
+        rules.into_iter().try_for_each(|x| match x {
+            Statement::Rule(rule) => reduce_rule(rule, context, typedefs),
+            Statement::Foreach(Foreach(name, expr, rules)) => {
+                reduce_expr(expr, &*context, None, typedefs)?
+                    .try_into_iter()?
+                    .try_for_each(|x| {
+                        add_to_context(name.clone(), x, context);
+                        reduce_rules(rules.clone(), context, typedefs)
+                    })
             }
-            add_to_context(x.0, expr, context);
-            Ok(())
+            Statement::If(If(cond, rules)) => match reduce_expr(cond, &*context, None, typedefs)? {
+                PartiallyCompiledExpression::Boolean(true) => {
+                    reduce_rules(rules, context, typedefs)
+                }
+                PartiallyCompiledExpression::Boolean(false) => Ok(()),
+                _ => todo!(),
+            },
         })
     }
 
@@ -1234,7 +1404,10 @@ mod compiler {
         }
     }
 
-    fn reduce(rules: Vec<Rule>, inputs: Vec<(Rc<str>, Structure)>) -> Result<Context, TypeError> {
+    fn reduce(
+        rules: Vec<Statement>,
+        inputs: Vec<(Rc<str>, Structure)>,
+    ) -> Result<Context, TypeError> {
         use crate::compiler::PartiallyCompiledExpression as PCE;
         let mut context = HashMap::with_capacity(inputs.len() + 5);
         inputs
@@ -1252,6 +1425,11 @@ mod compiler {
             PCE::Type(Primitive::Type.into()),
             &mut context,
         );
+        add_to_context(
+            "numeral".into(),
+            PCE::Type(Primitive::Numeral.into()),
+            &mut context,
+        );
         add_to_context("any".into(), PCE::Type(Type::Any), &mut context);
         add_to_context(
             "select".into(),
@@ -1267,6 +1445,35 @@ mod compiler {
                     Box::new(Expression::VarAccess("b".into())),
                     Box::new(Expression::VarAccess("c".into())),
                 )),
+            ),
+            &mut context,
+        );
+        add_to_context(
+            "inc".into(),
+            PCE::Component(
+                vec![("a".into(), Type::Primitive(Primitive::Numeral))],
+                Type::Primitive(Primitive::Numeral),
+                Box::new(Expression::Inc(Box::new(Expression::VarAccess("a".into())))),
+            ),
+            &mut context,
+        );
+        add_to_context(
+            "dec".into(),
+            PCE::Component(
+                vec![("a".into(), Type::Primitive(Primitive::Numeral))],
+                Type::Primitive(Primitive::Numeral),
+                Box::new(Expression::Dec(Box::new(Expression::VarAccess("a".into())))),
+            ),
+            &mut context,
+        );
+        add_to_context(
+            "is_zero".into(),
+            PCE::Component(
+                vec![("a".into(), Type::Primitive(Primitive::Numeral))],
+                Type::Primitive(Primitive::Bool),
+                Box::new(Expression::IsZero(Box::new(Expression::VarAccess(
+                    "a".into(),
+                )))),
             ),
             &mut context,
         );
@@ -1348,9 +1555,120 @@ mod compiler {
 
 fn main() {
     let string = "
-    INPUT i[200];
-    OUTPUT o[200];
-    o = map i: i select(i, false, true);
+INPUT;
+OUTPUT cells;
+N = 10;
+comp Range(n: numeral) -> any {
+    i = 0;
+    l = [];
+    foreach _: [bool; n] {
+        l = [..l, i];
+        i = inc(i);
+    }
+    l
+}
+comp or(vals: any) -> bool {
+    so_far = false;
+    foreach val: vals {
+        so_far = select(val, true, so_far);
+    }
+    so_far
+}
+comp and(vals: any) -> bool {
+    so_far = true;
+    foreach val: vals {
+        so_far = select(val, so_far, false);
+    }
+    so_far
+}
+comp not(val: bool) -> bool {
+    select(val, false, true)
+}
+comp cell(
+    up_left: bool,
+    up: bool,
+    up_right: bool,
+    left_left: bool,
+    left: bool,
+    center: bool,
+    right: bool,
+    down_left: bool,
+    down: bool,
+    down_right: bool) -> bool {
+    val = or(
+        up,
+        and(up_left, left, left_left),
+        and(up_right, right),
+        and(center, not(or(down_left, down, down_right))));
+    val
+}
+comp eq(n1: numeral, n2: numeral) -> bool {
+    if is_zero(n1) {
+        val = is_zero(n2);
+    }
+    if is_zero(n2) {
+        val = is_zero(n1);
+    }
+    if and([not(is_zero(n1)), not(is_zero(n2))]) {
+        val = eq(dec(n1), dec(n2));
+    }
+    val
+}
+comp update_cells(cells: [[bool; N]; N]) -> [[bool; N]; N] {
+    map x: Range(10) map y: Range(10) {
+        up_left = false;
+        up = false;
+        up_right = false;
+        left_left = false;
+        left = false;
+        center = false;
+        right = false;
+        down_left = false;
+        down = false;
+        down_right = false;
+        if not(is_zero(x)) {
+            left = cells[Pred(x)][y];
+            if Gt(y, 0) {
+                up_left = cells[Pred(x)][Pred(y)];
+            }
+            if Lt(y, Pred(N)) {
+                down_left = cells[Pred(x)][Succ(y)];
+            }
+            if Gt(x, 1) {
+                left_left = cells[Pred(Pred(x))][y];
+            }
+        }
+        if not(eq(inc(x), N)) {
+            right = cells[Succ(x)][y];
+            if Gt(y, 0) {
+                up_right = cells[Succ(x)][Pred(y)];
+            }
+            if Lt(y, Pred(H)) {
+                down_right = cells[Succ(x)][Succ(y)];
+            }
+        }
+        center = cells[x][y];
+        if Gt(y, 0) {
+            up = cells[x][Pred(y)];
+        }
+        if Lt(y, Pred(H)) {
+            down = cells[x][Succ(y)];
+        }
+        cell(
+            up_left,
+            up,
+            up_right,
+            left_left,
+            left,
+            center,
+            right,
+            down_left,
+            down,
+            down_right,
+        )
+    }
+}
+cells = update_cells(@[[bool; N]; N]);
     ";
     match full_parse(string).map(compile) {
         Ok(Ok(rules)) => println!("{rules:#?}"),
