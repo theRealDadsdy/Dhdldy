@@ -1,11 +1,23 @@
-comp or<N: numeral>(..vals: [bool; N]) -> bool {
+INPUT;
+OUTPUT cells;
+N = 10;
+comp Range(n: numeral) -> any {
+    i = 0;
+    l = [];
+    foreach _: [bool; n] {
+        l = [..l, i];
+        i = inc(i);
+    }
+    l
+}
+comp or(vals: any) -> bool {
     so_far = false;
     foreach val: vals {
         so_far = select(val, true, so_far);
     }
     so_far
 }
-comp and<N: numeral>(..vals: [bool; N]) -> bool {
+comp and(vals: any) -> bool {
     so_far = true;
     foreach val: vals {
         so_far = select(val, so_far, false);
@@ -33,8 +45,20 @@ comp cell(
         and(center, not(or(down_left, down, down_right))));
     val
 }
-comp update_cells<W: numeral, H: numeral>(cells: [[bool; H]; W]) -> [[bool; H]; W] {
-    map x: Range<W> map y: Range<H> {
+comp eq(n1: numeral, n2: numeral) -> bool {
+    if is_zero(n1) {
+        val = is_zero(n2);
+    }
+    if is_zero(n2) {
+        val = is_zero(n1);
+    }
+    if and([not(is_zero(n1)), not(is_zero(n2))]) {
+        val = eq(dec(n1), dec(n2));
+    }
+    val
+}
+comp update_cells(cells: [[bool; N]; N]) -> [[bool; N]; N] {
+    map x: Range(10) map y: Range(10) {
         up_left = false;
         up = false;
         up_right = false;
@@ -45,33 +69,33 @@ comp update_cells<W: numeral, H: numeral>(cells: [[bool; H]; W]) -> [[bool; H]; 
         down_left = false;
         down = false;
         down_right = false;
-        if Gt<x, 0> {
-            left = cells[Pred<x>][y];
-            if Gt<y, 0> {
-                up_left = cells[Pred<x>][Pred<y>];
+        if not(is_zero(x)) {
+            left = cells[Pred(x)][y];
+            if Gt(y, 0) {
+                up_left = cells[Pred(x)][Pred(y)];
             }
-            if Lt<y, Pred<H>> {
-                down_left = cells[Pred<x>][Succ<y>];
+            if Lt(y, Pred(N)) {
+                down_left = cells[Pred(x)][Succ(y)];
+            }
+            if Gt(x, 1) {
+                left_left = cells[Pred(Pred(x))][y];
             }
         }
-        if Gt<x, 1> {
-            left_left = cells[Pred<Pred<x>>][y];
-        }
-        if Lt<x, Pred<W>> {
-            right = cells[Succ<x>][y];
-            if Gt<y, 0> {
-                up_right = cells[Succ<x>][Pred<y>];
+        if not(eq(inc(x), N)) {
+            right = cells[Succ(x)][y];
+            if Gt(y, 0) {
+                up_right = cells[Succ(x)][Pred(y)];
             }
-            if Lt<y, Pred<H>> {
-                down_right = cells[Succ<x>][Succ<y>];
+            if Lt(y, Pred(H)) {
+                down_right = cells[Succ(x)][Succ(y)];
             }
         }
         center = cells[x][y];
-        if Gt<y, 0> {
-            up = cells[x][Pred<y>];
+        if Gt(y, 0) {
+            up = cells[x][Pred(y)];
         }
-        if Lt<y, Pred<H>> {
-            down = cells[x][Succ<y>];
+        if Lt(y, Pred(H)) {
+            down = cells[x][Succ(y)];
         }
         cell(
             up_left,
@@ -87,5 +111,4 @@ comp update_cells<W: numeral, H: numeral>(cells: [[bool; H]; W]) -> [[bool; H]; 
         )
     }
 }
-cells = update_cells(@[[bool; 10]; 10]);
-cells
+cells = update_cells(@[[bool; N]; N]);
