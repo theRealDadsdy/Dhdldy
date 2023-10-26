@@ -1,6 +1,7 @@
+
 INPUT;
-OUTPUT cells;
-N = 10;
+OUTPUT cells[2][2];
+N = 2;
 comp Range(n: numeral) -> any {
     i = 0;
     l = [];
@@ -37,13 +38,16 @@ comp cell(
     right: bool,
     down_left: bool,
     down: bool,
-    down_right: bool) -> bool {
-    val = or(
+    down_right: bool
+) -> bool {
+    or([
         up,
-        and(up_left, left, left_left),
-        and(up_right, right),
-        and(center, not(or(down_left, down, down_right))));
-    val
+        and([up_left, left, left_left]),
+        and([up_right, right]),
+        and([
+            center, not(or([down_left, down, down_right]))
+        ])
+    ])
 }
 comp eq(n1: numeral, n2: numeral) -> bool {
     if is_zero(n1) {
@@ -58,7 +62,7 @@ comp eq(n1: numeral, n2: numeral) -> bool {
     val
 }
 comp update_cells(cells: [[bool; N]; N]) -> [[bool; N]; N] {
-    map x: Range(10) map y: Range(10) {
+    map y: Range(N) map x: Range(N) {
         up_left = false;
         up = false;
         up_right = false;
@@ -70,32 +74,32 @@ comp update_cells(cells: [[bool; N]; N]) -> [[bool; N]; N] {
         down = false;
         down_right = false;
         if not(is_zero(x)) {
-            left = cells[Pred(x)][y];
-            if Gt(y, 0) {
-                up_left = cells[Pred(x)][Pred(y)];
+            left = cells[dec(x)][y];
+            if not(is_zero(y)) {
+                up_left = cells[dec(x)][dec(y)];
             }
-            if Lt(y, Pred(N)) {
-                down_left = cells[Pred(x)][Succ(y)];
+            if not(eq(inc(y), N)) {
+                down_left = cells[dec(x)][inc(y)];
             }
-            if Gt(x, 1) {
-                left_left = cells[Pred(Pred(x))][y];
+            if not(is_zero(dec(x))) {
+                left_left = cells[dec(dec(x))][y];
             }
         }
         if not(eq(inc(x), N)) {
-            right = cells[Succ(x)][y];
-            if Gt(y, 0) {
-                up_right = cells[Succ(x)][Pred(y)];
+            right = cells[inc(x)][y];
+            if not(is_zero(y)) {
+                up_right = cells[inc(x)][dec(y)];
             }
-            if Lt(y, Pred(H)) {
-                down_right = cells[Succ(x)][Succ(y)];
+            if not(eq(y, dec(N))) {
+                down_right = cells[inc(x)][inc(y)];
             }
         }
         center = cells[x][y];
-        if Gt(y, 0) {
-            up = cells[x][Pred(y)];
+        if not(is_zero(y)) {
+            up = cells[x][dec(y)];
         }
-        if Lt(y, Pred(H)) {
-            down = cells[x][Succ(y)];
+        if not(eq(y, dec(N))) {
+            down = cells[x][inc(y)];
         }
         cell(
             up_left,
